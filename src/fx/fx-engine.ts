@@ -124,6 +124,7 @@ export class VisualFxEngine {
     this.resetRandomStreams("piano-puzzle-fx");
     this.layer.visible = this.config.enabled;
     this.lightTrail.configure(this.config.lightTrailLifetimeMs, this.config.trailFadeSpeed);
+    this.syncKeyboardGlowSettings();
     if (!this.layer.parent) stage.addChild(this.layer);
   }
 
@@ -349,8 +350,9 @@ export class VisualFxEngine {
     for (let i = 0; i < whiteKeyCount; i++) {
       const x = i * whiteKeyWidth;
       keyboard.roundRect(x + 1, kbY, whiteKeyWidth - 2, kbHeight - 6, 4)
-        .fill({ color: 0x181c2a, alpha: 0.95 })
-        .stroke({ color: 0x252a40, width: 1, alpha: 0.7 });
+        // Do not stroke every key: the shared top edge would become a
+        // second horizontal line on top of the real Keyboard Glow.
+        .fill({ color: 0x181c2a, alpha: 0.95 });
     }
 
     // Black keys
@@ -361,8 +363,7 @@ export class VisualFxEngine {
       if (blackKeyPattern[i % 7] === 1) {
         const x = (i + 1) * whiteKeyWidth - blackKeyWidth / 2;
         keyboard.roundRect(x, kbY, blackKeyWidth, blackKeyHeight, 3)
-          .fill({ color: 0x0a0d14, alpha: 0.98 })
-          .stroke({ color: 0x181c2a, width: 1, alpha: 0.5 });
+          .fill({ color: 0x0a0d14, alpha: 0.98 });
       }
     }
 
@@ -620,7 +621,7 @@ export class VisualFxEngine {
       this.config.keyboardGlowSoftness,
       this.config.keyboardGlowDissolveSpeed,
       this.config.keyboardGlowPulseAmount,
-      1.0,
+      this.config.glowIntensity,
       keyboardGlowEnabled,
       this.config.keyboardGlowStyle
     );

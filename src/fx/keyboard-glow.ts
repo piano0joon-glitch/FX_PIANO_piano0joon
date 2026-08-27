@@ -373,13 +373,9 @@ export class KeyboardGlowController {
   private readonly upBeamTex: Texture;
   private readonly blobTex: Texture;
 
-  private readonly hazeSprite: Sprite;
   private readonly glowSprite: Sprite;
-  private readonly bandSprite: Sprite;
   private readonly coreSprite: Sprite;
 
-  private readonly shimmerA: Sprite;
-  private readonly shimmerB: Sprite;
   private readonly gpuStyle: GpuGlowStyleRenderer;
 
   private keyAnchors: KeyGlowAnchor[] = [];
@@ -393,6 +389,7 @@ export class KeyboardGlowController {
   private pulseAmount = 0.4;
   private glowStyle: "default" | "wave" | "fire" | "particles" = "default";
   private isEnabled = true;
+  private beamIntensity = 1;
 
   private paused = false;
   private time = 0;
@@ -429,23 +426,15 @@ export class KeyboardGlowController {
       return s;
     };
 
-    this.hazeSprite = mk(this.beamTex, 0x4d8fd6, this.ambientLayer);
     this.glowSprite = mk(this.beamTex, 0x9cc4ef, this.ambientLayer);
-    this.bandSprite = mk(this.beamTex, 0xe8f4ff, this.ambientLayer);
     this.coreSprite = mk(this.beamTex, 0xffffff, this.ambientLayer);
 
-    this.shimmerA = mk(this.blobTex, 0xffffff, this.ambientLayer);
-    this.shimmerB = mk(this.blobTex, 0xcfe6ff, this.ambientLayer);
     this.gpuStyle = new GpuGlowStyleRenderer();
     this.fxLayer.addChild(this.gpuStyle.mesh);
 
-    // Hide all ambient sprites until setKeyAnchors positions them correctly
-    this.hazeSprite.visible = false;
+    // Hide the single authoritative line until setKeyAnchors positions it.
     this.glowSprite.visible = false;
-    this.bandSprite.visible = false;
     this.coreSprite.visible = false;
-    this.shimmerA.visible = false;
-    this.shimmerB.visible = false;
   }
 
   setKeyAnchors(anchors: KeyGlowAnchor[]): void {
@@ -459,16 +448,12 @@ export class KeyboardGlowController {
     this.keyAnchors = anchors.slice().sort((a, b) => a.topPoint.x - b.topPoint.x);
     this.keyAnchorByMidi.clear();
     for (const anchor of this.keyAnchors) this.keyAnchorByMidi.set(anchor.midiNote, anchor);
-    this.renderBar(1.0, this.isEnabled);
+    this.renderBar(this.beamIntensity, this.isEnabled);
   }
 
   private hideAllVisuals(): void {
-    this.hazeSprite.visible = false;
     this.glowSprite.visible = false;
-    this.bandSprite.visible = false;
     this.coreSprite.visible = false;
-    this.shimmerA.visible = false;
-    this.shimmerB.visible = false;
     for (const s of this.wispPool) s.visible = false;
     for (const s of this.beamPool) s.visible = false;
     for (const s of this.flarePool) s.visible = false;
@@ -492,9 +477,9 @@ export class KeyboardGlowController {
     this.dissolveSpeed = clamp(dissolveSpeed, 0.1, 8);
     this.pulseAmount = clamp(pulseAmount, 0, 1);
     this.isEnabled = enabled;
+    this.beamIntensity = clamp(beamIntensity, 0, 1);
     if (style) this.glowStyle = style;
-    void beamIntensity;
-    this.renderBar(1.0, this.isEnabled);
+    this.renderBar(this.beamIntensity, this.isEnabled);
   }
 
   setPaused(paused: boolean): void {
@@ -558,13 +543,17 @@ export class KeyboardGlowController {
   }
 
   private acquireSprite(pool: Sprite[], tex: Texture, parent: Container): Sprite {
-    let s = pool.pop();
+    // Keep every created sprite in its pool. The previous pop-only approach
+    // lost the reference to newly-created sprites, so every frame appended
+    // more visible children and left ghost beams behind after resize/seek.
+    let s = pool.find((candidate) => !candidate.visible);
     if (!s) {
       s = new Sprite(tex);
       s.anchor.set(0.5, 0.5);
       s.blendMode = "add";
       s.roundPixels = true;
       parent.addChild(s);
+      pool.push(s);
     }
     s.texture = tex;
     s.visible = true;
@@ -572,7 +561,7 @@ export class KeyboardGlowController {
   }
 
   private renderBar(globalIntensity: number, enabled: boolean): void {
-    if (!enabled || !this.isEnabled || this.keyAnchors.length < 2) {
+    if (!enabled || !this.isEnabled || globalIntensity <= 0.001 || this.keyAnchors.length < 2) {
       this.hideAllVisuals();
       return;
     }
@@ -589,57 +578,23 @@ export class KeyboardGlowController {
     const cy = (firstP.y + lastP.y) / 2;
     const lineAngle = Math.atan2(dy, dx);
 
-    const breathe = 1 - this.pulseAmount * 0.22 * (0.5 + 0.5 * Math.sin(t * 1.6));
+    const breathe = 1 - this.pulseAmount * 0.16 * (0.5 + 0.5 * Math.sin(t * 1.6));
 
-    this.hazeSprite.visible = true;
-    this.hazeSprite.position.set(cx, cy);
-    this.hazeSprite.rotation = lineAngle;
-    this.hazeSprite.width = lineLen * 1.15;
-    this.hazeSprite.height = Math.max(4, this.spread * 3.2 * breathe);
-    this.hazeSprite.alpha = (0.12 + 0.22 * this.softness) * globalIntensity;
-
+    // One soft halo + one core are the complete horizontal Keyboard Glow.
+    // The old four overlapping beam sprites made a second, over-bright line.
     this.glowSprite.visible = true;
     this.glowSprite.position.set(cx, cy);
     this.glowSprite.rotation = lineAngle;
-    this.glowSprite.width = lineLen * 1.08;
-    this.glowSprite.height = Math.max(3, this.spread * 1.2 * breathe);
-    this.glowSprite.alpha = (0.28 + 0.35 * this.softness) * globalIntensity;
-
-    this.bandSprite.visible = true;
-    this.bandSprite.position.set(cx, cy);
-    this.bandSprite.rotation = lineAngle;
-    this.bandSprite.width = lineLen * 1.04;
-    this.bandSprite.height = Math.max(2, this.thickness * 4.5 + 4);
-    this.bandSprite.alpha = 0.65 * globalIntensity * breathe;
+    this.glowSprite.width = lineLen;
+    this.glowSprite.height = Math.max(3, this.spread * 0.9 * breathe);
+    this.glowSprite.alpha = 0.22 * this.softness * globalIntensity;
 
     this.coreSprite.visible = true;
     this.coreSprite.position.set(cx, cy);
     this.coreSprite.rotation = lineAngle;
-    this.coreSprite.width = lineLen * 1.01;
+    this.coreSprite.width = lineLen;
     this.coreSprite.height = Math.max(1.2, this.thickness * 1.5 + 1.0);
-    this.coreSprite.alpha = 0.98 * globalIntensity;
-
-    // Hide default shimmers — the GPU style mesh handles non-default effects.
-    this.shimmerA.visible = false;
-    this.shimmerB.visible = false;
-    if (this.glowStyle === "default") {
-      // ── DEFAULT: original shimmer blobs ──
-      const shimmerPos = (t * 0.13) % 1.6 - 0.3;
-      this.shimmerA.visible = true;
-      this.shimmerA.position.set(firstP.x + dx * shimmerPos, firstP.y + dy * shimmerPos);
-      this.shimmerA.rotation = lineAngle;
-      this.shimmerA.width = lineLen * 0.35;
-      this.shimmerA.height = this.spread * 0.9;
-      this.shimmerA.alpha = 0.12 * globalIntensity;
-
-      const shimmer2Pos = 1.6 - ((t * 0.09 + 0.5) % 1.6);
-      this.shimmerB.visible = true;
-      this.shimmerB.position.set(firstP.x + dx * shimmer2Pos, firstP.y + dy * shimmer2Pos);
-      this.shimmerB.rotation = lineAngle;
-      this.shimmerB.width = lineLen * 0.3;
-      this.shimmerB.height = this.spread * 0.7;
-      this.shimmerB.alpha = 0.08 * globalIntensity;
-    }
+    this.coreSprite.alpha = 0.92 * globalIntensity * breathe;
 
     this.gpuStyle.update(
       firstP,
@@ -655,6 +610,7 @@ export class KeyboardGlowController {
 
   update(deltaSeconds: number, enabled: boolean, globalIntensity: number): void {
     this.isEnabled = enabled;
+    const visualIntensity = clamp(this.beamIntensity * Math.max(0, globalIntensity), 0, 1);
     if (!enabled) {
       this.activeGlows.clear();
       this.fogWisps.length = 0;
@@ -716,15 +672,18 @@ export class KeyboardGlowController {
     for (const s of this.flarePool) s.visible = false;
     for (const s of this.sparklePool) s.visible = false;
 
-    this.renderBar(globalIntensity, enabled);
+    this.renderBar(
+      visualIntensity,
+      enabled
+    );
 
-    if (!enabled || !this.isEnabled || this.keyAnchors.length < 2) return;
+    if (!enabled || !this.isEnabled || visualIntensity <= 0.001 || this.keyAnchors.length < 2) return;
 
     for (const w of this.fogWisps) {
       const lifeRatio = w.life / w.maxLife;
       const fadeIn = Math.min(1, lifeRatio * 5);
       const fadeOut = Math.max(0, 1 - Math.pow(lifeRatio, 1.6));
-      const a = w.alpha * fadeIn * fadeOut * globalIntensity;
+      const a = w.alpha * fadeIn * fadeOut * visualIntensity;
       if (a <= 0.003) continue;
 
       const s = this.acquireSprite(this.wispPool, this.blobTex, this.fogLayer);
@@ -741,7 +700,7 @@ export class KeyboardGlowController {
 
       const p = anchor.topPoint;
       const kw = anchor.width;
-      const alpha = clamp(state.intensity * globalIntensity, 0, 1);
+      const alpha = clamp(state.intensity * visualIntensity, 0, 1);
       const age = this.time - state.birthTime;
       const attack = Math.min(1, age * 8);
       const beamH = this.spread * (1.2 + state.intensity * 0.8);
@@ -774,7 +733,7 @@ export class KeyboardGlowController {
 
     for (const sp of this.sparkles) {
       const lifeR = sp.life / sp.maxLife;
-      const a = (1 - lifeR) * globalIntensity * 0.6;
+      const a = (1 - lifeR) * visualIntensity * 0.6;
       if (a <= 0.01) continue;
       const s = this.acquireSprite(this.sparklePool, this.blobTex, this.fxLayer);
       s.anchor.set(0.5, 0.5);
