@@ -639,7 +639,15 @@ export class KeyboardGlowController {
   update(deltaSeconds: number, enabled: boolean, globalIntensity: number): void {
     this.isEnabled = enabled;
     if (!enabled) {
+      this.activeGlows.clear();
+      this.fogWisps.length = 0;
+      this.sparkles.length = 0;
+      for (const s of this.wispPool) s.visible = false;
+      for (const s of this.beamPool) s.visible = false;
+      for (const s of this.flarePool) s.visible = false;
+      for (const s of this.sparklePool) s.visible = false;
       this.gpuStyle.clear();
+      return;
     }
     if (!this.paused) {
       this.time += deltaSeconds;

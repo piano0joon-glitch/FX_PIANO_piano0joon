@@ -29,7 +29,9 @@ interface ActiveTrail {
 }
 
 const MAX_TRAIL_POINTS = 120;
-const MAX_RIBBON_POINTS = MAX_TRAIL_POINTS * 8 + 1; // Catmull-Rom subdivisions
+const TRAIL_RENDER_INTERVAL_MS = 1000 / 30;
+const CATMULL_ROM_SUBDIVISIONS = 4;
+const MAX_RIBBON_POINTS = MAX_TRAIL_POINTS * CATMULL_ROM_SUBDIVISIONS + 1;
 
 export class LightTrailController {
   readonly layer = new Container();
@@ -42,6 +44,7 @@ export class LightTrailController {
   private paused = false;
   private lifetimeMs = 1400;
   private fadeSpeed = 0.55;
+  private renderAccumulatorMs = TRAIL_RENDER_INTERVAL_MS;
 
   constructor() {
     this.glowRibbon = new GpuRibbon(MAX_RIBBON_POINTS);
@@ -60,6 +63,7 @@ export class LightTrailController {
 
   clear(): void {
     this.trails.clear();
+    this.renderAccumulatorMs = TRAIL_RENDER_INTERVAL_MS;
     this.glowRibbon.clear();
     this.coreRibbon.clear();
   }
@@ -113,7 +117,30 @@ export class LightTrailController {
       return;
     }
 
+    this.renderAccumulatorMs += Math.max(0, deltaMs);
     const trailsToRemove: string[] = [];
+    let forceRender = false;
+
+    // Age points every tick without allocating a filtered array. Geometry
+    // rebuilding below is throttled separately.
+    for (const [id, trail] of this.trails) {
+      for (const point of trail.points) point.age += deltaMs;
+      for (let index = trail.points.length - 1; index >= 0; index -= 1) {
+        if (trail.points[index].age >= this.lifetimeMs) trail.points.splice(index, 1);
+      }
+      if (trail.points.length < 2) {
+        forceRender = true;
+        if (trail.points.length === 0) trailsToRemove.push(id);
+      }
+    }
+    for (const id of trailsToRemove) this.trails.delete(id);
+    if (this.trails.size === 0) {
+      this.glowRibbon.clear();
+      this.coreRibbon.clear();
+      return;
+    }
+    if (!forceRender && this.renderAccumulatorMs < TRAIL_RENDER_INTERVAL_MS) return;
+    this.renderAccumulatorMs = 0;
 
     // Build a combined ribbon from ALL trails
     const glowPoints: Array<{ x: number; y: number }> = [];
@@ -124,21 +151,12 @@ export class LightTrailController {
     const coreAlphas: number[] = [];
 
     for (const [id, trail] of this.trails) {
-      // Age points
-      for (const point of trail.points) {
-        point.age += deltaMs;
-      }
-      trail.points = trail.points.filter((p) => p.age < this.lifetimeMs);
-
       if (trail.points.length < 2) {
-        if (trail.points.length === 0 || trail.points[0].age > this.lifetimeMs) {
-          trailsToRemove.push(id);
-        }
         continue;
       }
 
       // Catmull-Rom interpolation
-      const curvePoints = this.interpolateCatmullRom(trail.points, 8);
+      const curvePoints = this.interpolateCatmullRom(trail.points, CATMULL_ROM_SUBDIVISIONS);
       const totalLength = this.calculateTrailLength(curvePoints);
 
       if (totalLength < 1) continue;
@@ -213,9 +231,6 @@ export class LightTrailController {
       this.coreRibbon.clear();
     }
 
-    for (const id of trailsToRemove) {
-      this.trails.delete(id);
-    }
   }
 
   /* ------------------------------------------------------------------ */

@@ -172,6 +172,7 @@ export function App() {
   const audioEnabledRef = useRef(true);
   const audioRef = useRef<PianoSynth>(new PianoSynth());
   const lastAudioTimeMsRef = useRef(0);
+  const nextAudioEventIndexRef = useRef(0);
 
   // Musical Expression (Phase 7)
   const [expressionSettings, setExpressionSettings] = useState<ExpressionSettings>(() => normalizeExpressionSettings(project.expressionSettings));
@@ -670,7 +671,10 @@ export function App() {
     const mappingResult = mappingRef.current; if (!mappingResult) return undefined;
     const referenceImg = referenceFrameRef.current;
     const spawnPlacement = referenceImg?.width && referenceImg.height ? computeAlignedPlacement(referenceImg.width, referenceImg.height, DEFAULT_LAYOUT.pianoRegion, pianoPlacementRef.current) : { offsetX: 0, offsetY: 0, scale: 1 };
-    return { ...mappingResult, events: projectSpawnPoints(mappingResult.events, DEFAULT_LAYOUT.pianoRegion, spawnPlacement) };
+    const events = projectSpawnPoints(mappingResult.events, DEFAULT_LAYOUT.pianoRegion, spawnPlacement)
+      .slice()
+      .sort((a, b) => a.startTimeMs - b.startTimeMs);
+    return { ...mappingResult, events };
   }
 
   
@@ -864,10 +868,13 @@ export function App() {
       if (Math.abs(performer.currentTime - targetSeconds) > 0.18) performer.currentTime = targetSeconds;
     }
     const previousAudioTimeMs = lastAudioTimeMsRef.current;
-    if (shouldEvaluate && mappingRef.current && currentTimeMs > previousAudioTimeMs) {
+    if (shouldEvaluate && isPlaying && mappingRef.current) {
       const events = projectedMappingRef.current?.events ?? mappingRef.current.events;
-      for (const event of events) {
-        if ((event.startTimeMs > previousAudioTimeMs || (previousAudioTimeMs === 0 && event.startTimeMs === 0)) && event.startTimeMs <= currentTimeMs) {
+      if (currentTimeMs < previousAudioTimeMs) nextAudioEventIndexRef.current = 0;
+      let eventIndex = nextAudioEventIndexRef.current;
+      while (eventIndex < events.length && events[eventIndex].startTimeMs <= currentTimeMs) {
+        const event = events[eventIndex];
+        if (event.startTimeMs > previousAudioTimeMs || (previousAudioTimeMs === 0 && event.startTimeMs === 0)) {
           if (audioEnabledRef.current) audioRef.current.noteOn(event.midiNote, event.normalizedVelocity, event.durationMs);
           fxRef.current?.onNoteOn({
             id: event.id,
@@ -879,7 +886,9 @@ export function App() {
             playbackTimeMs: event.startTimeMs
           });
         }
+        eventIndex += 1;
       }
+      nextAudioEventIndexRef.current = eventIndex;
     }
     if (shouldEvaluate) {
       const previousStates = previousFrameStateRef.current;
@@ -974,6 +983,9 @@ export function App() {
     rebuildPianoBackground(puzzleTransformRef.current.k);
     const frames = engineRef.current.evaluateInto(clockRef.current.currentTimeMs) as PieceAnimationFrame[];
     framesRef.current = frames;
+    lastEvaluatedTimeRef.current = clockRef.current.currentTimeMs;
+    lastAudioTimeMsRef.current = clockRef.current.currentTimeMs;
+    nextAudioEventIndexRef.current = 0;
     rendererRef.current?.update(frames, puzzleTransformRef.current.k, timingRef.current, clockRef.current.currentTimeMs);
     setDebugFrames(frames);
   }, [mapping, geometry, timingSettings, expressionSettings, midi, puzzleArtwork, referenceFrame, showPieceBorders, artworkPlacement, pianoPlacement, outputSettings.width, outputSettings.height]);

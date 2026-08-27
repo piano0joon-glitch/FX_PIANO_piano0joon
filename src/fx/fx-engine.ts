@@ -517,10 +517,20 @@ export class VisualFxEngine {
     // Lighting disabled for performance
 
     this.keyboardGlow.setPaused(this.paused);
-    this.keyboardGlow.applySettings(this.config.keyboardGlowThickness, this.config.keyboardGlowSpread, this.config.keyboardGlowSoftness, this.config.keyboardGlowDissolveSpeed, this.config.keyboardGlowPulseAmount, 1.0);
-    this.keyboardGlow.update(deltaSeconds, this.config.keyboardGlowEnabled && this.config.enabled, 1.0);
-    this.glowController.update(deltaMs);
-    this.impactEffect.update(deltaMs);
+    const keyboardGlowEnabled = this.config.keyboardGlowEnabled && this.config.enabled;
+    this.keyboardGlow.applySettings(
+      this.config.keyboardGlowThickness,
+      this.config.keyboardGlowSpread,
+      this.config.keyboardGlowSoftness,
+      this.config.keyboardGlowDissolveSpeed,
+      this.config.keyboardGlowPulseAmount,
+      1.0,
+      keyboardGlowEnabled,
+      this.config.keyboardGlowStyle
+    );
+    this.keyboardGlow.update(deltaSeconds, keyboardGlowEnabled, 1.0);
+    if (this.glowController.activeCount > 0) this.glowController.update(deltaMs);
+    if (this.impactEffect.activeCount > 0) this.impactEffect.update(deltaMs);
     this.lightTrail.setPaused(this.paused);
     this.lightTrail.update(deltaMs);
     this.ambientDust.setEnabled(this.config.ambientDustEnabled && this.config.enabled);
@@ -529,7 +539,7 @@ export class VisualFxEngine {
     this.ambientDust.update(deltaMs);
     if (!this.paused) this.particlePool.update(deltaSeconds);
     if (!this.paused) this.smokeController.update(deltaSeconds);
-    if (!this.paused) {
+    if (!this.paused && this.trails.size > 0) {
       for (const frame of frames) {
         if (frame.state !== "moving") continue;
         const trail = this.trails.get(frame.pieceId);
