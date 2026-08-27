@@ -107,6 +107,11 @@ export class LightTrailController {
       this.coreRibbon.clear();
       return;
     }
+    if (this.trails.size === 0) {
+      this.glowRibbon.clear();
+      this.coreRibbon.clear();
+      return;
+    }
 
     const trailsToRemove: string[] = [];
 
