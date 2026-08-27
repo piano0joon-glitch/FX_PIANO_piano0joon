@@ -34,6 +34,9 @@ const RIBBON_VERTEX = `
 in vec2 aPosition;
 in float aAlpha;
 
+uniform mat3 uProjectionMatrix;
+uniform mat3 uWorldTransformMatrix;
+uniform vec4 uWorldColorAlpha;
 uniform vec4 uColor;
 
 out vec4 vColor;

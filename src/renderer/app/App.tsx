@@ -806,12 +806,19 @@ export function App() {
   function refreshKeyboardGlowAnchors() {
     const fx = fxRef.current;
     const calibrationValue = calibrationRef.current;
-    if (!fx || !calibrationValue) return;
+    if (!fx) return;
+    if (!calibrationValue) {
+      fx.setKeyboardGlowAnchors([]);
+      return;
+    }
 
     const refImg = referenceFrameImageRef.current;
     const refW = refImg?.naturalWidth ?? referenceFrameRef.current?.width;
     const refH = refImg?.naturalHeight ?? referenceFrameRef.current?.height;
-    if (!refW || !refH) return;
+    if (!refW || !refH) {
+      fx.setKeyboardGlowAnchors([]);
+      return;
+    }
 
     const keyPlacement = computeAlignedPlacement(
       refW,

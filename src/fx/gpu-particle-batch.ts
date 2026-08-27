@@ -58,6 +58,9 @@ in vec4 aParticle4;
 in vec4 aParticle5;
 in vec4 aParticle6;
 
+uniform mat3 uProjectionMatrix;
+uniform mat3 uWorldTransformMatrix;
+uniform vec4 uWorldColorAlpha;
 uniform float uTime;
 
 out vec2 vUV;

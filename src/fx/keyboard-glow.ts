@@ -64,6 +64,9 @@ const GLOW_STYLE_VERTEX = `
 in vec2 aPosition;
 in vec2 aUV;
 
+uniform mat3 uProjectionMatrix;
+uniform mat3 uWorldTransformMatrix;
+
 out vec2 vUV;
 
 void main(void)
@@ -81,6 +84,7 @@ uniform float uStyle;
 uniform float uIntensity;
 uniform float uThickness;
 uniform vec4 uColor;
+uniform vec4 uWorldColorAlpha;
 
 float hash21(vec2 p)
 {
