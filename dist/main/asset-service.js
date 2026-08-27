@@ -4,20 +4,40 @@ import path from "node:path";
 const { dialog } = electron;
 const filters = {
     image: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    video: [{ name: "Videos", extensions: ["mp4", "mov", "webm", "m4v"] }],
     midi: [{ name: "MIDI", extensions: ["mid", "midi"] }],
     audio: [{ name: "Audio", extensions: ["wav", "mp3", "ogg", "m4a"] }]
 };
+function mimeTypeForExtension(extension) {
+    if (extension === ".jpg" || extension === ".jpeg")
+        return "image/jpeg";
+    if (extension === ".png")
+        return "image/png";
+    if (extension === ".webp")
+        return "image/webp";
+    if (extension === ".mid" || extension === ".midi")
+        return "audio/midi";
+    if (extension === ".mp4" || extension === ".m4v")
+        return "video/mp4";
+    if (extension === ".mov")
+        return "video/quicktime";
+    if (extension === ".webm")
+        return "video/webm";
+    if (extension === ".wav")
+        return "audio/wav";
+    if (extension === ".mp3")
+        return "audio/mpeg";
+    if (extension === ".ogg")
+        return "audio/ogg";
+    if (extension === ".m4a")
+        return "audio/mp4";
+    return "application/octet-stream";
+}
 // 🧪 TEST: Read file by absolute path without dialog (DELETE AFTER TESTING)
 export async function readAssetByPath(filePath) {
     const stat = await fs.stat(filePath);
     const extension = path.extname(filePath).toLowerCase();
-    const mimeType = extension === ".jpg" || extension === ".jpeg"
-        ? "image/jpeg"
-        : extension === ".png"
-            ? "image/png"
-            : extension === ".mid" || extension === ".midi"
-                ? "audio/midi"
-                : "application/octet-stream";
+    const mimeType = mimeTypeForExtension(extension);
     const bytes = await fs.readFile(filePath);
     return { filePath, fileName: path.basename(filePath), fileSize: stat.size, mimeType, dataBase64: bytes.toString("base64") };
 }
@@ -28,7 +48,7 @@ export async function chooseAsset(type) {
     const filePath = result.filePaths[0];
     const stat = await fs.stat(filePath);
     const extension = path.extname(filePath).toLowerCase();
-    const mimeType = type === "image" ? `image/${extension === ".jpg" || extension === ".jpeg" ? "jpeg" : extension.slice(1)}` : type === "midi" ? "audio/midi" : `audio/${extension.slice(1)}`;
+    const mimeType = mimeTypeForExtension(extension);
     const bytes = await fs.readFile(filePath);
     return { filePath, fileName: path.basename(filePath), fileSize: stat.size, mimeType, dataBase64: bytes.toString("base64") };
 }
