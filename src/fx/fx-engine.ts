@@ -69,19 +69,17 @@ export class VisualFxEngine {
   private readonly ambientDust = new AmbientDustSystem();
   private readonly assetPipeline = new FxAssetPipeline();
   private readonly demoLayer = new Container();
-  // ribbonRibbon removed — lightTrail handles all trail rendering via GPU mesh
   private demoPieces: DemoPiece[] = [];
   private demoActive = false;
   private demoTimeMs = 0;
   private demoBackdrop: Graphics | undefined;
   private demoFlashRings: { x: number; y: number; age: number; maxAge: number; maxRadius: number; color: number }[] = [];
   private demoRevealGraphic: Graphics | undefined;
-  private demoRevealFlashMs = 0;
-  private demoAmbientGlow: Graphics | undefined;
   private demoAmbientStars: Graphics | undefined;
   private demoKeyboard: Graphics | undefined;
   private config: VisualFxConfig = DEFAULT_VISUAL_FX_CONFIG;
   private trails = new Map<string, TrailState>();
+  private keyAnchorMap = new Map<number, { topPoint: { x: number; y: number }; width: number }>();
   private paused = false;
   private fps = 60;
   private lastEvent = "none";
@@ -108,7 +106,16 @@ export class VisualFxEngine {
   private galaxySpawnTimer = 0;
 
   constructor() {
-    this.layer.addChild(this.ambientDust.layer, this.keyboardGlow.layer, this.demoLayer, this.lightTrail.layer, this.smokeController.layer, this.particlePool.layer, this.glowController.layer, this.impactEffect.layer);
+    this.layer.addChild(
+      this.ambientDust.layer,
+      this.keyboardGlow.layer,
+      this.demoLayer,
+      this.lightTrail.layer,
+      this.smokeController.layer,
+      this.particlePool.layer,
+      this.glowController.layer,
+      this.impactEffect.layer
+    );
     this.layer.zIndex = 1000;
   }
 
@@ -148,32 +155,63 @@ export class VisualFxEngine {
     this.lightTrail.configure(this.config.lightTrailLifetimeMs, this.config.trailFadeSpeed);
     this.syncKeyboardGlowSettings();
     if (!this.config.enabled) this.clearTransient();
-    // Only restart demo if the preset changed — other config changes
-    // (like pathCurvature, particleDensity, etc.) are read live each frame
-    // and don't need a full restart that clears all particles/trails.
     if (wasDemoActive && this.config.preset !== oldPreset) {
       this.startDemo();
     }
   }
 
+  /**
+   * Clears all active GPU buffers, particles, and smoke to eliminate stale artifacts/ghosting on transform/scale change.
+   */
+  clearAllBuffers(): void {
+    this.clearTransient();
+  }
+
+  /**
+   * Updates key anchors for strict geometric homography / transform sync.
+   */
+  setKeyAnchors(anchors: { midiNote: number; topPoint: { x: number; y: number }; width: number }[]): void {
+    this.keyAnchorMap.clear();
+    for (const anchor of anchors) {
+      this.keyAnchorMap.set(anchor.midiNote, {
+        topPoint: { x: anchor.topPoint.x, y: anchor.topPoint.y },
+        width: anchor.width
+      });
+    }
+    this.keyboardGlow.setKeyAnchors(anchors);
+    // Instant clear of transient particles to prevent any position lag/ghosting during calibration/scale adjustment
+    this.clearTransient();
+  }
+
+  private resolveKeySpawnPoint(midiNote: number, fallbackPosition: { x: number; y: number }): { x: number; y: number } {
+    const anchor = this.keyAnchorMap.get(midiNote);
+    if (anchor) {
+      return { x: anchor.topPoint.x + anchor.width * 0.5, y: anchor.topPoint.y };
+    }
+    return fallbackPosition;
+  }
+
   onNoteOn(event: FxNoteEvent): void {
     if (!this.acceptNoteEvent(event)) return;
     const tuning = getFxPresetTuning(this.config.preset);
+    const spawnOrigin = this.resolveKeySpawnPoint(event.midiNote, event.position);
     const intensity = this.config.glowIntensity * tuning.glowMultiplier * (0.35 + Math.max(0, Math.min(1, event.normalizedVelocity)) * 0.65);
     const behavior = this.behaviorForMidi(event.midiNote);
     const sourceColor = this.getColorForPitch(event.midiNote);
     const color = this.isStardustPreset() ? this.stardustColorFor(behavior, sourceColor, event.midiNote) : sourceColor;
-    if (this.config.glowEnabled) this.glowController.add(event.position, color, intensity, this.config.glowDurationMs + Math.min(700, event.durationMs * 0.15), event.midiNote < 48 ? 34 : 25);
+
+    // 1. Geometric locked Glow
+    if (this.config.glowEnabled) {
+      this.glowController.add(spawnOrigin, color, intensity, this.config.glowDurationMs + Math.min(700, event.durationMs * 0.15), event.midiNote < 48 ? 34 : 25);
+    }
+
+    // 2. Geometric locked Particles
     if (this.isStardustPreset() && this.config.particlesEnabled) {
-      this.emitStardustNoteBurst(event.position, color, event.normalizedVelocity, behavior);
-    }
-    if (!this.isStardustPreset() && this.config.smokeEnabled && tuning.smokeMultiplier > 0 && behavior === "bass") {
-      this.emitSmokeNote(event.position, this.smokeColorFor(behavior, color), event.normalizedVelocity, behavior);
-    }
-    if (!this.isStardustPreset() && this.config.particlesEnabled && behavior === "high") {
+      this.emitStardustNoteBurst(spawnOrigin, color, event.normalizedVelocity, behavior);
+    } else if (this.config.particlesEnabled && behavior === "high") {
       const textureId: FxTextureId = event.midiNote % 2 === 0 ? "soft-bokeh" : "light-streak";
       this.tryAcquireParticle(
-        event.position,
+        spawnOrigin,
         { x: this.random.signed(5), y: -this.random.range(4, 12) },
         this.config.particleLifetimeMs * 1.35,
         color,
@@ -182,20 +220,25 @@ export class VisualFxEngine {
         textureId === "light-streak" ? 0.58 : 0.68
       );
     }
-    // Ambient dust reacts to notes
+
+    // 3. Fully Active Organic Smoke
+    if (this.config.smokeEnabled && (tuning.smokeMultiplier > 0 || this.config.smokeDensity > 0.05)) {
+      this.emitSmokeNote(spawnOrigin, this.smokeColorFor(behavior, color), event.normalizedVelocity, behavior);
+    }
+
+    // 4. Reactive Key Pulse & Keyboard Line Glow
     this.ambientDust.noteHit(event.midiNote, event.normalizedVelocity);
-    // Lighting disabled for performance
     if (this.config.keyboardGlowEnabled) {
       this.keyboardGlow.hitKeyByNote(event.midiNote, color, 0.35 + event.normalizedVelocity * 0.65);
     }
-    // Tone-reactive mid-range sparkle burst
+
     if (this.config.toneReactiveEnabled && this.config.particlesEnabled && behavior === "neutral") {
       const sparkleCount = Math.round(3 + event.normalizedVelocity * 5);
       for (let i = 0; i < sparkleCount; i++) {
         const angle = (Math.PI * 2 * i) / sparkleCount + this.random.signed(0.4);
         const speed = this.random.range(2, 8);
         this.tryAcquireParticle(
-          { x: event.position.x + this.random.signed(6), y: event.position.y + this.random.signed(6) },
+          { x: spawnOrigin.x + this.random.signed(6), y: spawnOrigin.y + this.random.signed(6) },
           { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed - 2 },
           this.random.range(300, 800),
           color,
@@ -218,8 +261,10 @@ export class VisualFxEngine {
     const behavior = this.behaviorForMidi(event.midiNote);
     const sourceColor = this.getColorForPitch(event.midiNote);
     const color = this.isStardustPreset() ? this.stardustColorFor(behavior, sourceColor, event.midiNote) : sourceColor;
-    const pathDx = event.targetPosition.x - event.position.x;
-    const pathDy = event.targetPosition.y - event.position.y;
+    const spawnOrigin = this.resolveKeySpawnPoint(event.midiNote, event.position);
+
+    const pathDx = event.targetPosition.x - spawnOrigin.x;
+    const pathDy = event.targetPosition.y - spawnOrigin.y;
     const pathDistance = Math.hypot(pathDx, pathDy) || 1;
     const pathNormalX = -pathDy / pathDistance;
     const pathNormalY = pathDx / pathDistance;
@@ -232,33 +277,32 @@ export class VisualFxEngine {
         * Math.min(1.15, tuning.curveMultiplier * 0.7)
       )
       : 0;
+
     this.trails.set(event.pieceId, {
-      x: event.position.x,
-      y: event.position.y,
-      origin: { ...event.position },
+      x: spawnOrigin.x,
+      y: spawnOrigin.y,
+      origin: { ...spawnOrigin },
       targetPosition: { ...event.targetPosition },
       control: {
-        x: event.position.x + pathDx * 0.5 + pathNormalX * pathBend,
-        y: event.position.y + pathDy * 0.5 + pathNormalY * pathBend
+        x: spawnOrigin.x + pathDx * 0.5 + pathNormalX * pathBend,
+        y: spawnOrigin.y + pathDy * 0.5 + pathNormalY * pathBend
       },
       color,
       intensity: event.intensity,
       midiNote: event.midiNote,
-      points: [{ x: event.position.x, y: event.position.y, age: 0 }],
+      points: [{ x: spawnOrigin.x, y: spawnOrigin.y, age: 0 }],
       lastSmokeEmitMs: event.playbackTimeMs - this.config.smokeEmissionIntervalMs,
       emissionIndex: 0
     });
+
     if (this.config.glowEnabled) {
-      this.glowController.add(event.position, color, this.config.glowIntensity * tuning.glowMultiplier * event.intensity, this.config.revealDurationMs, 16 + event.intensity * 18);
+      this.glowController.add(spawnOrigin, color, this.config.glowIntensity * tuning.glowMultiplier * event.intensity, this.config.revealDurationMs, 16 + event.intensity * 18);
     }
-    // Particles are emitted along the trail path in the per-frame update loop,
-    // NOT here. This ensures they follow the same curved Bézier path as the light trail.
-    if (!this.isStardustPreset() && this.config.smokeEnabled && tuning.smokeMultiplier > 0) {
-      this.emitSmokeLaunch(event.position, event.targetPosition, this.smokeColorFor(behavior, color), event.intensity, behavior);
+    if (this.config.smokeEnabled && (tuning.smokeMultiplier > 0 || this.config.smokeDensity > 0.05)) {
+      this.emitSmokeLaunch(spawnOrigin, event.targetPosition, this.smokeColorFor(behavior, color), event.intensity, behavior);
     }
-    // Start light trail
     if (this.config.lightTrailEnabled) {
-      this.lightTrail.startTrail(event.pieceId, color, event.intensity, event.position, this.config.lightTrailWidth, this.config.lightTrailGlowLayers);
+      this.lightTrail.startTrail(event.pieceId, color, event.intensity, spawnOrigin, this.config.lightTrailWidth, this.config.lightTrailGlowLayers);
     }
     this.lastEvent = `launch:${event.pieceId}`;
   }
@@ -275,12 +319,15 @@ export class VisualFxEngine {
       this.impactEffect.add(event.position, color, this.config.impactIntensity * event.intensity, this.config.impactDurationMs);
     }
     if (!this.isStardustPreset() && this.config.particlesEnabled) this.emitSparkles(event.position, color, event.intensity);
-    if (!this.isStardustPreset() && this.config.smokeEnabled && tuning.smokeMultiplier > 0) this.emitSmokeBurst(event.position, this.smokeColorFor(behavior, color), event.intensity, behavior);
+    if (this.config.smokeEnabled && (tuning.smokeMultiplier > 0 || this.config.smokeDensity > 0.05)) {
+      this.emitSmokeBurst(event.position, this.smokeColorFor(behavior, color), event.intensity, behavior);
+    }
     if (!this.isStardustPreset() && this.config.particlesEnabled && behavior === "high") {
       this.emitHighShimmer(event.position, { x: 0, y: -1 }, color, event.intensity, 0);
     }
-    if (this.config.glowEnabled) this.glowController.add(event.position, color, this.config.glowIntensity * tuning.glowMultiplier * event.intensity, this.config.lockFadeDurationMs, 22 + event.intensity * 18);
-    // End light trail
+    if (this.config.glowEnabled) {
+      this.glowController.add(event.position, color, this.config.glowIntensity * tuning.glowMultiplier * event.intensity, this.config.lockFadeDurationMs, 22 + event.intensity * 18);
+    }
     if (this.config.lightTrailEnabled) {
       this.lightTrail.endTrail(event.pieceId);
     }
@@ -295,41 +342,30 @@ export class VisualFxEngine {
     this.demoActive = true;
     this.demoTimeMs = 0;
 
-    // Dark cinematic background
     this.demoBackdrop = new Graphics();
     this.demoBackdrop.rect(0, 0, 1080, 1920).fill({ color: 0x050810, alpha: 1 });
     this.demoLayer.addChild(this.demoBackdrop);
 
-    // Ambient atmospheric glow layers
-    this.drawAmbientGlow();
-    if (this.demoAmbientGlow) this.demoAmbientGlow.alpha = 1;
-
-    // Draw ambient star field
     this.drawAmbientStars();
     if (this.demoAmbientStars) this.demoAmbientStars.alpha = 1;
 
-    // Draw piano keyboard at the bottom
     this.drawPianoKeyboard();
     if (this.demoKeyboard) this.demoKeyboard.alpha = 1;
 
-    // Flash rings layer
     const flashRings = new Graphics();
     flashRings.label = 'flashRings';
     this.demoLayer.addChild(flashRings);
 
-    // Reveal graphic — white flash overlay for final reveal
     this.demoRevealGraphic = new Graphics();
     this.demoRevealGraphic.rect(0, 0, 1080, 1920).fill({ color: 0xffffff, alpha: 0 });
     this.demoRevealGraphic.visible = false;
     this.demoLayer.addChild(this.demoRevealGraphic);
 
-    // Anchor real Keyboard Glow to demo keyboard top line
     this.keyboardGlow.setKeyAnchors([
       { midiNote: 21, topPoint: { x: 0, y: 1700 }, width: 25 },
       { midiNote: 108, topPoint: { x: 1080, y: 1700 }, width: 25 }
     ]);
 
-    // Spawn first wave of pieces from keyboard upward
     this.spawnDemoWave();
     this.lastEvent = "demo-start";
   }
@@ -342,20 +378,15 @@ export class VisualFxEngine {
     const whiteKeyCount = 21;
     const whiteKeyWidth = totalWidth / whiteKeyCount;
 
-    // Keyboard background glow
     keyboard.rect(0, kbY - 12, totalWidth, kbHeight + 24)
       .fill({ color: 0x080c18, alpha: 0.95 });
 
-    // White keys
     for (let i = 0; i < whiteKeyCount; i++) {
       const x = i * whiteKeyWidth;
       keyboard.roundRect(x + 1, kbY, whiteKeyWidth - 2, kbHeight - 6, 4)
-        // Do not stroke every key: the shared top edge would become a
-        // second horizontal line on top of the real Keyboard Glow.
         .fill({ color: 0x181c2a, alpha: 0.95 });
     }
 
-    // Black keys
     const blackKeyPattern = [1, 1, 0, 1, 1, 1, 0];
     const blackKeyWidth = whiteKeyWidth * 0.58;
     const blackKeyHeight = kbHeight * 0.55;
@@ -367,14 +398,8 @@ export class VisualFxEngine {
       }
     }
 
-    // Glow lines are handled exclusively by KeyboardGlowController.
     this.demoLayer.addChild(keyboard);
     this.demoKeyboard = keyboard;
-  }
-
-
-  private drawAmbientGlow(): void {
-    // Ambient glow removed for cleaner look
   }
 
   private drawAmbientStars(): void {
@@ -404,44 +429,15 @@ export class VisualFxEngine {
         { midi: 57, tx: 420, ty: 180 }, { midi: 60, tx: 560, ty: 120 },
         { midi: 64, tx: 700, ty: 180 }, { midi: 67, tx: 840, ty: 300 },
         { midi: 72, tx: 940, ty: 450 },
-      ],
-      [
-        { midi: 45, tx: 100, ty: 300 }, { midi: 52, tx: 250, ty: 150 },
-        { midi: 57, tx: 400, ty: 400 }, { midi: 62, tx: 550, ty: 200 },
-        { midi: 67, tx: 700, ty: 350 }, { midi: 71, tx: 850, ty: 150 },
-        { midi: 76, tx: 980, ty: 300 },
-      ],
-      [
-        { midi: 48, tx: 350, ty: 250 }, { midi: 50, tx: 400, ty: 200 },
-        { midi: 52, tx: 450, ty: 280 }, { midi: 55, tx: 500, ty: 180 },
-        { midi: 57, tx: 550, ty: 240 }, { midi: 60, tx: 600, ty: 160 },
-        { midi: 62, tx: 650, ty: 220 }, { midi: 64, tx: 700, ty: 280 },
-      ],
+      ]
     ];
-    let wave = waves[waveIndex];
+    const wave = waves[waveIndex % waves.length];
 
-    // Apply path style ordering
     let orderedWave = [...wave];
     if (pathStyle === "random") {
       orderedWave = wave.map(item => ({ ...item })).sort(() => this.random.nextFloat() - 0.5);
     } else if (pathStyle === "reverse") {
       orderedWave = [...wave].reverse();
-    } else if (pathStyle === "spiral") {
-      // Sort by distance from center — pieces fly outward in a spiral pattern
-      const cx = 540, cy = 400;
-      orderedWave = wave.map(item => ({ ...item })).sort((a, b) => {
-        const da = Math.hypot(a.tx - cx, a.ty - cy);
-        const db = Math.hypot(b.tx - cx, b.ty - cy);
-        return da - db;
-      });
-    } else if (pathStyle === "scattered") {
-      // Random positions scattered across canvas
-      const midis = [48, 50, 52, 55, 57, 60, 62, 64];
-      orderedWave = midis.map(midi => ({
-        midi,
-        tx: this.random.range(100, 950),
-        ty: this.random.range(100, 600)
-      }));
     }
 
     orderedWave.forEach((item, index) => {
@@ -468,17 +464,7 @@ export class VisualFxEngine {
         .stroke({ color, width: 1.5, alpha: 0.2 });
       targetGhost.position.set(target.x, target.y);
       this.demoLayer.addChild(targetGhost);
-      // Stagger timing based on path style
-      let startMs: number;
-      if (pathStyle === "random") {
-        startMs = index * 180 + this.random.range(0, 300);
-      } else if (pathStyle === "spiral") {
-        startMs = index * 250 + this.random.range(0, 100);
-      } else if (pathStyle === "scattered") {
-        startMs = this.random.range(0, 1200);
-      } else {
-        startMs = index * 220 + this.random.range(0, 80);
-      }
+      const startMs = index * 220 + this.random.range(0, 80);
       this.demoPieces.push({
         id: `demo-${item.midi}-${index}-${waveIndex}`,
         midiNote: item.midi,
@@ -516,7 +502,6 @@ export class VisualFxEngine {
       this.commitFrameMetrics();
       return;
     }
-    // Lighting disabled for performance
 
     this.syncKeyboardGlowSettings();
     const keyboardGlowEnabled = this.config.keyboardGlowEnabled && this.config.enabled;
@@ -544,7 +529,7 @@ export class VisualFxEngine {
           }
           if (this.config.smokeDensity > 0.02 && playbackTimeMs - trail.lastSmokeEmitMs >= this.config.smokeEmissionIntervalMs) {
             const behavior = this.behaviorForMidi(trail.midiNote);
-            if (this.config.smokeEnabled && getFxPresetTuning(this.config.preset).smokeMultiplier > 0) {
+            if (this.config.smokeEnabled && (getFxPresetTuning(this.config.preset).smokeMultiplier > 0 || this.config.smokeDensity > 0.05)) {
               this.emitSmokeAlongPath(
                 { x: trail.x, y: trail.y },
                 position,
@@ -561,7 +546,6 @@ export class VisualFxEngine {
             trail.emissionIndex += 1;
           }
           if (this.config.trailEnabled) this.recordTrail(trail, position);
-          // Add point to light trail
           if (this.config.lightTrailEnabled) {
             this.lightTrail.addPoint(frame.pieceId, position.x, position.y);
           }
@@ -577,23 +561,18 @@ export class VisualFxEngine {
       this.updateGalaxy(deltaMs);
     }
     if (!this.paused) {
-      // Upload only the compact spawn/release changes made during this tick.
-      // Particle motion itself is evaluated by the GPU vertex shader.
       this.particlePool.flush();
       this.smokeController.flush();
     }
-    this.updateRibbons(deltaMs);
     this.commitFrameMetrics();
   }
 
   onPause(): void {
     this.paused = true;
-
   }
 
   onResume(): void {
     this.paused = false;
-
   }
 
   onSeek(): void {
@@ -606,7 +585,6 @@ export class VisualFxEngine {
     this.clearTransient();
     this.clearDemo();
     this.resetRandomStreams("piano-puzzle-fx");
-
     this.lastEvent = "reset";
   }
 
@@ -628,7 +606,7 @@ export class VisualFxEngine {
   }
 
   setKeyboardGlowAnchors(anchors: { midiNote: number; topPoint: { x: number; y: number }; width: number }[]): void {
-    this.keyboardGlow.setKeyAnchors(anchors);
+    this.setKeyAnchors(anchors);
   }
 
   getStats(): FxDebugStats {
@@ -662,7 +640,6 @@ export class VisualFxEngine {
     this.smokeController.dispose();
     this.glowController.dispose();
     this.impactEffect.dispose();
-
     this.keyboardGlow.dispose();
     this.lightTrail.dispose();
     this.ambientDust.dispose();
@@ -726,7 +703,6 @@ export class VisualFxEngine {
       piece.graphic.position.set(position.x, position.y);
       piece.graphic.rotation = Math.sin(progress * Math.PI * 2.5 + piece.midiNote * 0.3) * 0.06;
 
-      // Trail particles along the path
       const trail = this.trails.get(piece.id);
       if (trail && progress < 1) {
         const dist = Math.hypot(position.x - trail.x, position.y - trail.y);
@@ -736,7 +712,7 @@ export class VisualFxEngine {
           }
           if (this.config.smokeDensity > 0.02 && this.demoTimeMs - trail.lastSmokeEmitMs >= this.config.smokeEmissionIntervalMs * 0.6) {
             const behavior = this.behaviorForMidi(trail.midiNote);
-            if (this.config.smokeEnabled && getFxPresetTuning(this.config.preset).smokeMultiplier > 0) {
+            if (this.config.smokeEnabled && (getFxPresetTuning(this.config.preset).smokeMultiplier > 0 || this.config.smokeDensity > 0.05)) {
               this.emitSmokeAlongPath(
                 { x: trail.x, y: trail.y }, position,
                 this.smokeColorFor(behavior, trail.color),
@@ -747,7 +723,6 @@ export class VisualFxEngine {
             trail.emissionIndex += 1;
           }
           this.recordTrail(trail, position);
-          // Add point to light trail in demo mode
           if (this.config.lightTrailEnabled) {
             this.lightTrail.addPoint(piece.id, position.x, position.y);
           }
@@ -756,7 +731,6 @@ export class VisualFxEngine {
         }
       }
 
-      // Glow pulse while moving — gated by glowEnabled + glowIntensity
       piece.pulseMs += deltaMs;
       if (piece.pulseMs >= 55 && progress < 0.95 && this.config.glowEnabled && this.config.glowIntensity > 0.02) {
         piece.pulseMs = 0;
@@ -764,12 +738,10 @@ export class VisualFxEngine {
       }
       piece.lastPosition = position;
 
-      // Lock effect when reaching target position — cinematic flash
       if (progress >= 1 && !piece.locked) {
         piece.locked = true;
         const allLocked = this.demoPieces.every((p) => p.locked);
         this.onPieceLock({ pieceId: piece.id, position: piece.target, midiNote: piece.midiNote, intensity: 1.0, playbackTimeMs: this.demoTimeMs });
-        // Multiple expanding rings — gated by impactIntensity
         if (this.config.impactIntensity > 0.02) {
           const ringColor = allLocked ? 0xffffff : piece.color;
           const ringScale = this.config.impactIntensity;
@@ -777,7 +749,6 @@ export class VisualFxEngine {
           this.demoFlashRings.push({ x: piece.target.x, y: piece.target.y, age: -80, maxAge: 480, maxRadius: (allLocked ? 700 : 220) * ringScale, color: ringColor });
           this.demoFlashRings.push({ x: piece.target.x, y: piece.target.y, age: -160, maxAge: 600, maxRadius: (allLocked ? 900 : 300) * ringScale, color: ringColor });
         }
-        // Burst particles — gated by particlesEnabled + particleDensity
         if (this.config.particlesEnabled && this.config.particleDensity > 0.02) {
           const bd = this.config.particleDensity;
           const burstCount = Math.round((allLocked ? 140 : 70) * bd * bd * bd);
@@ -797,7 +768,6 @@ export class VisualFxEngine {
             );
           }
         }
-        // Glow bursts — gated by glowEnabled + glowIntensity
         if (this.config.glowEnabled && this.config.glowIntensity > 0.02) {
           const gi = this.config.glowIntensity;
           this.glowController.add(piece.target, allLocked ? 0xffffff : piece.color, gi, allLocked ? 1400 : 800, allLocked ? 110 : 60);
@@ -805,7 +775,6 @@ export class VisualFxEngine {
             this.glowController.add(piece.target, piece.color, gi * 0.8, 1800, 160);
           }
         }
-        // Full image reveal flash for last piece — gated by glowIntensity
         if (allLocked && this.demoRevealGraphic && this.config.glowIntensity > 0.02) {
           this.demoRevealGraphic.alpha = 0;
           this.demoRevealGraphic.visible = true;
@@ -813,7 +782,7 @@ export class VisualFxEngine {
         }
       }
     }
-    // Update flash rings — multi-layer cinematic expanding rings
+
     const flashGraphics = this.demoLayer.getChildByName('flashRings') as Graphics | undefined;
     if (flashGraphics) flashGraphics.clear();
     for (let i = this.demoFlashRings.length - 1; i >= 0; i--) {
@@ -827,33 +796,24 @@ export class VisualFxEngine {
       const radius = ring.maxRadius * (0.05 + t * 0.95);
       const alpha = Math.pow(1 - t, 2.5) * 0.8;
       if (flashGraphics) {
-        // Outer soft glow — big, faint, atmospheric
         flashGraphics.circle(ring.x, ring.y, radius * 1.4);
         flashGraphics.fill({ color: ring.color, alpha: alpha * 0.12 });
-        // Mid ring
         flashGraphics.circle(ring.x, ring.y, radius);
         flashGraphics.fill({ color: ring.color, alpha: alpha * 0.45 });
-        // Inner bright ring
         flashGraphics.circle(ring.x, ring.y, radius * 0.65);
         flashGraphics.fill({ color: 0xffffff, alpha: alpha * 0.35 });
-        // Core bright spot
         flashGraphics.circle(ring.x, ring.y, radius * 0.2);
         flashGraphics.fill({ color: 0xffffff, alpha: alpha * 0.6 });
-        // Thin ring outline for lens flare feel
         flashGraphics.circle(ring.x, ring.y, radius * 0.85);
         flashGraphics.stroke({ color: 0xffffff, width: 1.5, alpha: alpha * 0.3 });
       }
     }
     if (flashGraphics) flashGraphics.label = 'flashRings';
 
-    // Update reveal flash for last piece — cinematic radial light burst
     if (this.demoRevealGraphic && this.demoRevealGraphic.visible) {
       this.demoRevealFlashMs += deltaMs;
       const revealDuration = 2400;
       const t = Math.min(1, this.demoRevealFlashMs / revealDuration);
-      // Phase 1: bright flash in (0-20%)
-      // Phase 2: radial sweep outward (20-60%)
-      // Phase 3: gentle fade out (60-100%)
       let alpha: number;
       if (t < 0.2) {
         alpha = (t / 0.2) * 0.9;
@@ -870,7 +830,6 @@ export class VisualFxEngine {
       }
     }
 
-    // Respawn after all pieces locked
     const allLocked = this.demoPieces.length > 0 && this.demoPieces.every((p) => p.locked);
     const revealDone = !this.demoRevealGraphic || !this.demoRevealGraphic.visible;
     if (allLocked && this.demoTimeMs > 600 && revealDone) {
@@ -880,17 +839,13 @@ export class VisualFxEngine {
       this.demoLayer.removeChildren().forEach((child) => child.destroy());
       this.demoBackdrop = undefined;
       this.demoRevealGraphic = undefined;
-      // Rebuild background
       this.demoBackdrop = new Graphics();
       this.demoBackdrop.rect(0, 0, 1080, 1920).fill({ color: 0x050810, alpha: 1 });
       this.demoLayer.addChild(this.demoBackdrop);
-      this.drawAmbientGlow();
-      if (this.demoAmbientGlow) this.demoAmbientGlow.alpha = 1;
       this.drawAmbientStars();
       if (this.demoAmbientStars) this.demoAmbientStars.alpha = 1;
       this.drawPianoKeyboard();
       if (this.demoKeyboard) this.demoKeyboard.alpha = 1;
-      // Re-add reveal graphic
       this.demoRevealGraphic = new Graphics();
       this.demoRevealGraphic.rect(0, 0, 1080, 1920).fill({ color: 0xffffff, alpha: 0 });
       this.demoRevealGraphic.visible = false;
@@ -907,7 +862,6 @@ export class VisualFxEngine {
     this.demoLayer.removeChildren().forEach((child) => child.destroy());
     this.demoBackdrop = undefined;
     this.demoRevealGraphic = undefined;
-    this.demoAmbientGlow = undefined;
     this.demoAmbientStars = undefined;
     this.demoKeyboard = undefined;
   }
@@ -926,14 +880,12 @@ export class VisualFxEngine {
       ((seed >> 6) % 3) !== 0,
     ];
     const glowLevel = this.config.glowIntensity;
-    // Outer glow halo — only when glow is active
     if (glowLevel > 0.01) {
       graphic.circle(0, 0, Math.max(w, h) * 0.85)
         .fill({ color, alpha: 0.06 * glowLevel });
       graphic.circle(0, 0, Math.max(w, h) * 0.65)
         .fill({ color, alpha: 0.12 * glowLevel });
     }
-    // Puzzle piece body with tabs
     const hw = w / 2, hh = h / 2;
     graphic.moveTo(-hw, -hh);
     if (hasTab[0]) { graphic.lineTo(-hw + 2, -hh); graphic.circle(-hw + w * 0.5, -hh - tabR * 0.7, tabR); graphic.lineTo(hw - 2, -hh); }
@@ -948,7 +900,6 @@ export class VisualFxEngine {
     graphic.fill({ color, alpha: Math.max(0.15, 0.92 * Math.max(glowLevel, 0.15)) });
     graphic.stroke({ color: 0xffffff, width: 1.8, alpha: Math.max(0.1, 0.55 * glowLevel) });
 
-    // Inner glow highlight — only when glow is active
     if (glowLevel > 0.01) {
       graphic.roundRect(-hw * 0.5, -hh * 0.6, w * 0.5, h * 0.35, 3)
         .fill({ color: 0xffffff, alpha: 0.22 * glowLevel });
@@ -978,17 +929,15 @@ export class VisualFxEngine {
     const distance = Math.hypot(dx, dy) || 1;
     const direction = invert ? -1 : 1;
     const d2 = this.config.particleDensity;
-    // Linear formula: count scales directly with density
     const count = Math.round(d2 * 30 * (0.35 + this.config.trailLength) * tuning.trailMultiplier);
     const dirX = dx / distance;
     const dirY = dy / distance;
     for (let i = 0; i < count; i += 1) {
-      const spread = this.random.signed(6 + this.config.pathCurvature * 10); // tighter spread for streaks
+      const spread = this.random.signed(6 + this.config.pathCurvature * 10);
       const normalX = -dy / distance;
       const normalY = dx / distance;
       const swirl = tuning.swirl * this.config.pathCurvature * Math.sin(i * 1.7 + this.demoTimeMs * 0.01) * 6;
-      // Streak velocity: strong along motion direction + slight perpendicular wobble
-      const speed = this.random.range(18, 40); // faster = more streak-like
+      const speed = this.random.range(18, 40);
       const texId = this.chooseTrailTexture();
       const isStreak = texId === "light-streak" || texId === "micro-streak";
       this.tryAcquireParticle(
@@ -1010,7 +959,6 @@ export class VisualFxEngine {
     if (this.config.particleDensity <= 0.02) return;
     const tuning = getFxPresetTuning(this.config.preset);
     const sd = this.config.particleDensity;
-    // Linear formula: count scales directly with density
     const count = Math.round(sd * 22 * tuning.sparkleMultiplier);
     for (let i = 0; i < count; i += 1) {
       const angle = (Math.PI * 2 * i) / count;
@@ -1047,7 +995,6 @@ export class VisualFxEngine {
     const direction = invert ? -1 : 1;
     const behavior = hasTrail ? this.behaviorForMidi(target.midiNote) : "neutral";
     const d = this.config.particleDensity;
-    // Linear formula: count scales directly with density
     const count = isLocalTrail
       ? Math.round(d * 400)
       : Math.round(
@@ -1268,21 +1215,18 @@ export class VisualFxEngine {
   }
 
   private emitSmokeNote(position: { x: number; y: number }, color: number, intensity: number, behavior: FxSmokeBehavior): void {
-    if (this.config.smokeDensity <= 0.02) return;
     const tuning = getFxPresetTuning(this.config.preset);
     const smokeIntensity = this.smokeIntensityMultiplier(behavior);
-    // Core smoke
     this.tryAcquireSmoke(
       position,
       { x: this.random.signed(2), y: -this.random.range(2, 6) },
       this.config.particleLifetimeMs * this.random.range(2.2, 3.2),
       color,
       this.config.particleSize * tuning.smokeVolumeScale * Math.sqrt(smokeIntensity) * this.random.range(13, 20),
-      (0.16 + intensity * 0.18) * smokeIntensity,
+      (0.2 + intensity * 0.25) * smokeIntensity,
       "volume",
       behavior
     );
-    // Cinematic wispy tendrils — thin, long-lived, drifting
     if (this.config.cinematicSmokeEnabled) {
       const wispCount = 2 + Math.floor(intensity * 3);
       for (let i = 0; i < wispCount; i++) {
@@ -1294,7 +1238,7 @@ export class VisualFxEngine {
           this.config.particleLifetimeMs * this.random.range(3.5, 5.5),
           color,
           this.config.particleSize * this.random.range(6, 14),
-          (0.08 + intensity * 0.12) * smokeIntensity,
+          (0.12 + intensity * 0.15) * smokeIntensity,
           "residue",
           behavior
         );
@@ -1309,7 +1253,6 @@ export class VisualFxEngine {
     intensity: number,
     behavior: FxSmokeBehavior
   ): void {
-    if (this.config.smokeDensity <= 0.02) return;
     const tuning = getFxPresetTuning(this.config.preset);
     const dx = target.x - position.x;
     const dy = target.y - position.y;
@@ -1323,7 +1266,7 @@ export class VisualFxEngine {
       y: direction * dy / distance * pathSpeed - (behavior === "bass" ? 1.5 : 4)
     };
     const smokeIntensity = this.smokeIntensityMultiplier(behavior);
-    const baseAlpha = (0.2 + intensity * 0.24) * smokeIntensity;
+    const baseAlpha = (0.22 + intensity * 0.26) * smokeIntensity;
     const baseLifetime = this.config.particleLifetimeMs * (behavior === "bass" ? 2.55 : behavior === "high" ? 1.35 : 2.05);
     const baseRadius = this.config.particleSize * (0.72 + intensity * 0.55) * Math.sqrt(smokeIntensity);
     const layerCount = this.config.smokeLayerCount;
@@ -1341,42 +1284,6 @@ export class VisualFxEngine {
         behavior
       );
     }
-    if (layerCount >= 3) {
-      this.emitSmokeLayer(
-        { x: position.x + normalX * this.random.signed(10), y: position.y + normalY * this.random.signed(10) },
-        { x: baseVelocity.x * 0.5 + normalX * this.random.signed(4), y: baseVelocity.y * 0.5 + normalY * this.random.signed(4) },
-        baseLifetime * 1.45,
-        color,
-        baseRadius * tuning.smokeResidueScale * this.random.range(16, 24),
-        baseAlpha * 0.52,
-        "residue",
-        behavior
-      );
-    }
-    if (behavior !== "high") {
-      this.emitSmokeLayer(
-        { x: position.x + normalX * this.random.signed(5), y: position.y + normalY * this.random.signed(5) },
-        { x: baseVelocity.x * 0.68, y: baseVelocity.y * 0.68 },
-        baseLifetime * 0.88,
-        color,
-        baseRadius * tuning.smokeCoreScale * this.random.range(8, 12),
-        baseAlpha * 0.66,
-        "core",
-        behavior
-      );
-    }
-    if (behavior === "bass" && layerCount >= 2) {
-      this.emitSmokeLayer(
-        { x: position.x + normalX * this.random.signed(12), y: position.y + normalY * this.random.signed(12) },
-        { x: baseVelocity.x * 0.4, y: baseVelocity.y * 0.4 - 2 },
-        baseLifetime * 1.25,
-        color,
-        baseRadius * tuning.smokeVolumeScale * this.random.range(16, 22),
-        baseAlpha * 0.42,
-        "volume",
-        behavior
-      );
-    }
   }
 
   private emitSmokeAlongPath(
@@ -1387,7 +1294,6 @@ export class VisualFxEngine {
     behavior: FxSmokeBehavior,
     emissionIndex: number
   ): void {
-    if (this.config.smokeDensity <= 0.02) return;
     const tuning = getFxPresetTuning(this.config.preset);
     const dx = current.x - previous.x;
     const dy = current.y - previous.y;
@@ -1402,7 +1308,7 @@ export class VisualFxEngine {
         : Math.min(3, Math.max(2, Math.ceil(distance / 42)));
     const baseLifetime = this.config.particleLifetimeMs * (behavior === "bass" ? 2.4 : behavior === "high" ? 1.18 : 1.9);
     const smokeIntensity = this.smokeIntensityMultiplier(behavior);
-    const baseAlpha = (0.17 + intensity * 0.22) * smokeIntensity;
+    const baseAlpha = (0.2 + intensity * 0.25) * smokeIntensity;
     const baseRadius = this.config.particleSize * (0.7 + intensity * 0.5) * Math.sqrt(smokeIntensity);
 
     for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
@@ -1431,62 +1337,16 @@ export class VisualFxEngine {
         "core",
         behavior
       );
-      if (this.config.smokeLayerCount >= 2) {
-        this.emitSmokeLayer(
-          { x: basePosition.x + normalX * this.random.signed(7), y: basePosition.y + normalY * this.random.signed(7) },
-          { x: baseVelocity.x * 0.72 + normalX * this.random.signed(4), y: baseVelocity.y * 0.72 + normalY * this.random.signed(4) },
-          baseLifetime * 1.2,
-          color,
-          baseRadius * tuning.smokeVolumeScale * this.random.range(12, 18),
-          sampleAlpha * (behavior === "high" ? 0.36 : 0.72),
-          "volume",
-          behavior
-        );
-      }
-      if (behavior === "bass" && this.config.smokeLayerCount >= 3) {
-        this.emitSmokeLayer(
-          { x: basePosition.x + normalX * this.random.signed(11), y: basePosition.y + normalY * this.random.signed(11) },
-          { x: baseVelocity.x * 0.45, y: baseVelocity.y * 0.45 - 1.5 },
-          baseLifetime * 1.45,
-          color,
-          baseRadius * tuning.smokeResidueScale * this.random.range(15, 22),
-          sampleAlpha * 0.46,
-          "residue",
-          behavior
-        );
-      }
-      // Cinematic wispy tendrils — thin, long, swirling
-      if (this.config.cinematicSmokeEnabled && sampleIndex === 0) {
-        const tendrilCount = 2;
-        for (let t = 0; t < tendrilCount; t++) {
-          const tAngle = Math.random() * Math.PI * 2;
-          const tSpread = 4 + Math.random() * 8;
-          this.tryAcquireSmoke(
-            { x: basePosition.x + Math.cos(tAngle) * tSpread, y: basePosition.y + Math.sin(tAngle) * tSpread },
-            {
-              x: Math.cos(tAngle) * 0.8 + baseVelocity.x * 0.3 + this.random.signed(2),
-              y: Math.sin(tAngle) * 0.6 - this.random.range(0.5, 2)
-            },
-            baseLifetime * this.random.range(1.8, 2.8),
-            color,
-            baseRadius * this.random.range(4, 9),
-            sampleAlpha * 0.25,
-            "residue",
-            behavior
-          );
-        }
-      }
     }
   }
 
   private emitSmokeBurst(position: { x: number; y: number }, color: number, intensity: number, behavior: FxSmokeBehavior): void {
-    if (this.config.smokeDensity <= 0.02) return;
     const tuning = getFxPresetTuning(this.config.preset);
     const layerCount = behavior === "bass" ? Math.min(3, this.config.smokeLayerCount) : Math.min(2, this.config.smokeLayerCount);
     const baseSpeed = behavior === "bass" ? 5 : behavior === "high" ? 9 : 7;
     const baseLifetime = this.config.particleLifetimeMs * (behavior === "bass" ? 2.45 : behavior === "high" ? 1.2 : 1.75);
     const smokeIntensity = this.smokeIntensityMultiplier(behavior);
-    const baseAlpha = (0.16 + intensity * 0.2) * smokeIntensity;
+    const baseAlpha = (0.18 + intensity * 0.22) * smokeIntensity;
     for (let layerIndex = 0; layerIndex < layerCount; layerIndex += 1) {
       const angle = (Math.PI * 2 * layerIndex) / Math.max(1, layerCount) + this.random.signed(0.38);
       const layer: FxSmokeLayer = layerIndex === 0 ? "core" : layerIndex === 1 ? "volume" : "residue";
@@ -1665,16 +1525,14 @@ export class VisualFxEngine {
       const roll = this.random.nextFloat();
       return roll < 0.35 ? "glow-orb" : roll < 0.65 ? "soft-orb" : roll < 0.82 ? "warm-orb" : "sharp-dot";
     }
-    // Streaky textures for trail — aligned to motion direction
     const roll = this.random.nextFloat();
     let textureId: FxTextureId;
-    if (roll < 0.40) textureId = "light-streak";       // 40% — long elegant streak
-    else if (roll < 0.65) textureId = "micro-streak";   // 25% — short thin streak
-    else if (roll < 0.80) textureId = "spark-cross";    // 15% — cross-shaped sparkle
-    else if (roll < 0.92) textureId = "ember-small";     // 12% — tiny ember dot
-    else textureId = "micro-spark";                      // 8% — micro spark
+    if (roll < 0.40) textureId = "light-streak";
+    else if (roll < 0.65) textureId = "micro-streak";
+    else if (roll < 0.80) textureId = "spark-cross";
+    else if (roll < 0.92) textureId = "ember-small";
+    else textureId = "micro-spark";
     if (textureId === this.lastTrailTexture && this.random.nextFloat() < 0.65) {
-      // Avoid repeating the same texture too often
       textureId = textureId === "light-streak" ? "micro-streak" : "light-streak";
     }
     this.lastTrailTexture = textureId;
@@ -1685,7 +1543,7 @@ export class VisualFxEngine {
     const tuning = getFxPresetTuning(this.config.preset);
     const behaviorMultiplier = behavior === "bass" ? tuning.bassSmokeMultiplier : behavior === "high" ? tuning.highSmokeMultiplier : 1;
     const densityMultiplier = 0.55 + this.config.smokeDensity * 1.2;
-    return Math.max(0.08, Math.min(2.6, tuning.smokeMultiplier * behaviorMultiplier * densityMultiplier));
+    return Math.max(0.08, Math.min(2.6, Math.max(0.6, tuning.smokeMultiplier) * behaviorMultiplier * densityMultiplier));
   }
 
   private getColorForPitch(midiNote: number): number {
@@ -1713,28 +1571,24 @@ export class VisualFxEngine {
   private stardustColorFor(behavior: FxSmokeBehavior, sourceColor: number, midiNote: number): number {
     let baseColor: number;
     if (this.config.preset === "pink-nebula") {
-      // Dense pink/magenta field
       baseColor = behavior === "bass"
         ? 0xff0066
         : behavior === "high"
           ? (midiNote % 3 === 0 ? 0xff1493 : 0xff69b4)
           : (midiNote % 2 === 0 ? 0xcc0055 : 0xff3399);
     } else if (this.config.preset === "purple-vortex") {
-      // Deep purple swirl
       baseColor = behavior === "bass"
         ? 0x6a00cc
         : behavior === "high"
           ? (midiNote % 3 === 0 ? 0x9b30ff : 0xb040ff)
           : (midiNote % 2 === 0 ? 0x8a2be2 : 0x7b00cc);
     } else if (this.config.preset === "sparkle-burst") {
-      // Bright white sparkles
       baseColor = behavior === "bass"
         ? 0xf0f0ff
         : behavior === "high"
           ? (midiNote % 3 === 0 ? 0xffffff : 0xf8f8ff)
           : (midiNote % 2 === 0 ? 0xe8e8ff : 0xf0f0ff);
     } else if (this.config.preset === "firework-streaks") {
-      // Cool white streaks
       baseColor = behavior === "bass"
         ? 0xe0e8ff
         : behavior === "high"
@@ -1794,14 +1648,9 @@ export class VisualFxEngine {
       || this.config.preset === "firework-streaks" || this.config.preset === "purple-vortex";
   }
 
-  /** Adjust particle size based on density to prevent saturation */
   private adjustedParticleSize(): number {
     const density = this.config.particleDensity;
     const baseSize = this.config.particleSize;
-    // Size scales inversely with density to prevent visual overload
-    // At density 0.0: size = 0.3 (tiny)
-    // At density 0.5: size = 0.7
-    // At density 1.0: size = 1.0 (full)
     const densityFactor = 0.3 + density * 0.7;
     return baseSize * densityFactor;
   }
@@ -1837,9 +1686,6 @@ export class VisualFxEngine {
     const maxPoints = 5 + Math.round(this.config.trailLength * 28);
     if (trail.points.length > maxPoints) trail.points.splice(0, trail.points.length - maxPoints);
   }
-
-  // updateRibbons removed — lightTrail handles all trail rendering via GPU mesh
-  private updateRibbons(_deltaMs: number): void {}
 
   private updateVortex(deltaMs: number): void {
     if (!this.vortexActive) {
@@ -1882,22 +1728,6 @@ export class VisualFxEngine {
         (0.55 + this.vortexIntensity * 0.35) * this.random.range(0.8, 1.2)
       );
     }
-    if (this.config.smokeEnabled && tuning.smokeMultiplier > 0 && this.random.nextFloat() < 0.3) {
-      const smokeAngle = this.vortexAngle * 0.7 + this.random.signed(0.5);
-      const smokeRadius = 60 + this.random.range(0, 200);
-      const sx = this.vortexCenter.x + Math.cos(smokeAngle) * smokeRadius;
-      const sy = this.vortexCenter.y + Math.sin(smokeAngle) * smokeRadius * 0.4;
-      this.tryAcquireSmoke(
-        { x: sx, y: sy },
-        { x: Math.cos(smokeAngle + 1.2) * 5, y: -3 },
-        this.config.particleLifetimeMs * 2.5,
-        0xff6600,
-        this.config.particleSize * 18 * this.random.range(0.8, 1.3),
-        0.08 * tuning.smokeMultiplier,
-        "volume",
-        "neutral"
-      );
-    }
   }
 
   private updateGalaxy(deltaMs: number): void {
@@ -1936,20 +1766,6 @@ export class VisualFxEngine {
         this.config.particleSize * tuning.particleScale * textureScale * this.random.range(0.7, 1.5),
         textureId,
         (0.45 + this.config.glowIntensity * 0.4) * this.random.range(0.8, 1.2)
-      );
-    }
-    if (this.config.smokeEnabled && tuning.smokeMultiplier > 0 && this.random.nextFloat() < 0.25) {
-      const smokeAngle = this.galaxyAngle * 0.6 + this.random.signed(0.6);
-      const smokeRadius = 50 + this.random.range(0, 180);
-      this.tryAcquireSmoke(
-        { x: 540 + Math.cos(smokeAngle) * smokeRadius, y: 550 + Math.sin(smokeAngle) * smokeRadius * 0.4 },
-        { x: Math.cos(smokeAngle + 1) * 4, y: -2 },
-        this.config.particleLifetimeMs * 2.2,
-        0x9944cc,
-        this.config.particleSize * 15 * this.random.range(0.8, 1.2),
-        0.06 * tuning.smokeMultiplier,
-        "volume",
-        "neutral"
       );
     }
   }
@@ -1992,7 +1808,6 @@ export class VisualFxEngine {
       const wobbleY = Math.cos(progress * 9 + piece.midiNote * 1.3) * 25 * (1 - eased * 0.7);
       return { x: baseX + wobbleX, y: baseY + wobbleY };
     }
-    // Default: curved (bezier)
     return this.quadraticBezier(from, piece.control, target, eased);
   }
 
