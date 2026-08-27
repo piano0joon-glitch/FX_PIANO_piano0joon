@@ -4,6 +4,10 @@ import { fileURLToPath } from "node:url";
 import { chooseAsset, readAssetByPath } from "./asset-service.js";
 const { app, BrowserWindow, ipcMain } = electron;
 // Force Hardware Accelerated GPU & WebGL / WebGPU rasterization
+// On dual-GPU laptops Chromium may otherwise select the integrated adapter.
+// This switch makes the desktop app request the discrete GPU before Chromium
+// creates its renderer/GPU processes.
+app.commandLine.appendSwitch("force_high_performance_gpu");
 app.commandLine.appendSwitch("ignore-gpu-blocklist");
 app.commandLine.appendSwitch("enable-gpu-rasterization");
 app.commandLine.appendSwitch("enable-zero-copy");
@@ -12,7 +16,11 @@ app.commandLine.appendSwitch("enable-webgl");
 app.commandLine.appendSwitch("enable-webgl2-compute-context");
 app.commandLine.appendSwitch("enable-accelerated-2d-canvas");
 app.commandLine.appendSwitch("enable-accelerated-video-decode");
-app.commandLine.appendSwitch("use-gl", "desktop"); // Use dedicated GPU GL driver
+// GPU preference switching on Windows is effective through ANGLE/EGL.
+// Desktop GL can keep the renderer attached to the integrated adapter.
+app.commandLine.appendSwitch("use-gl", "angle");
+app.commandLine.appendSwitch("use-angle", "d3d11");
+app.commandLine.appendSwitch("use-cmd-decoder", "passthrough");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 function createWindow() {
     const window = new BrowserWindow({
