@@ -42,7 +42,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   ipcMain.handle("app:info", () => ({ name: "Piano Puzzle Studio", version: app.getVersion() }));
-  ipcMain.handle("asset:choose", (_event, type: "image" | "midi" | "audio") => chooseAsset(type));
+  ipcMain.handle("asset:choose", (_event, type: "image" | "video" | "midi" | "audio") => chooseAsset(type));
   // 🧪 TEST: Read file by path (DELETE AFTER TESTING)
   ipcMain.handle("asset:read-by-path", (_event, filePath: string) => readAssetByPath(filePath));
   createWindow();

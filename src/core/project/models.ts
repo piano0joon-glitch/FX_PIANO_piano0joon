@@ -1,11 +1,12 @@
-export type AssetType = "image" | "midi" | "audio";
+export type AssetType = "image" | "video" | "midi" | "audio";
 export type AssetStatus = "empty" | "loading" | "loaded" | "error";
-export type AssetRole = "reference-piano-frame" | "puzzle-artwork" | "midi";
+export type AssetRole = "reference-piano-frame" | "puzzle-artwork" | "performer-video" | "midi";
 import type { Calibration } from "../../keyboard/models";
 import type { MidiMappingConfig } from "../../puzzle/puzzle-event-models";
 import type { AnimationTimingSettings } from "../../animation/models";
 import type { ExpressionSettings } from "../../expression/models";
 import { DEFAULT_EXPRESSION_SETTINGS } from "../../expression/expression-store";
+import { DEFAULT_VIDEO_CROP, DEFAULT_VIDEO_OUTPUT_SETTINGS, type VideoCropSettings, type VideoOutputSettings } from "../../video/models";
 
 export interface Asset {
   id: string;
@@ -30,8 +31,11 @@ export interface Project {
   createdAt: string;
   updatedAt: string;
   imageAsset?: Asset;
+  videoAsset?: Asset;
   midiAsset?: Asset;
   audioAsset?: Asset;
+  videoCrop: VideoCropSettings;
+  outputSettings: VideoOutputSettings;
   canvasSettings: { width: number; height: number; fit: "contain" | "cover" };
   midiSettings: { selectedTrackIndices: number[]; chordTolerance: number };
   previewSettings: { fps: 30 | 60; loop: boolean; currentTime: number };
@@ -54,6 +58,8 @@ export function createProject(): Project {
     createdAt: now,
     updatedAt: now,
     canvasSettings: { width: 1080, height: 1920, fit: "contain" },
+    videoCrop: DEFAULT_VIDEO_CROP,
+    outputSettings: DEFAULT_VIDEO_OUTPUT_SETTINGS,
     midiSettings: { selectedTrackIndices: [], chordTolerance: 0.045 },
     previewSettings: { fps: 60, loop: false, currentTime: 0 },
     midiMappingConfig: { enabled: true, mappingMode: "deterministic-sequence", outOfRangePolicy: "mark-invalid", chordWindowMs: 45, showDebugMarkers: true, showAssignmentLines: false, sequenceCycle: true },
@@ -96,6 +102,6 @@ export function createProject(): Project {
     overlapMode: "allow-overlap",
     debugVisible: true,
     expressionSettings: DEFAULT_EXPRESSION_SETTINGS,
-    version: "0.2.0"
+    version: "0.3.0"
   };
 }
