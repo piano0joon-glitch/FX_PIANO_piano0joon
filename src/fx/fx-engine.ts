@@ -119,6 +119,7 @@ export class VisualFxEngine {
     this.smokeController.setTexturePipeline(this.assetPipeline);
     this.glowController.setTexturePipeline(this.assetPipeline);
     this.impactEffect.setTexturePipeline(this.assetPipeline);
+    this.ambientDust.setTexturePipeline(this.assetPipeline);
 
     this.resetRandomStreams("piano-puzzle-fx");
     this.layer.visible = this.config.enabled;
