@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 // @ts-ignore — TEST BUTTON, DELETE AFTER TESTING
 import { runTestLoad, type TestLoadCallbacks } from "./test-load-button";
 import "pixi.js/unsafe-eval";
@@ -30,10 +30,11 @@ import { DEFAULT_EXPRESSION_SETTINGS, normalizeExpressionSettings } from "../../
 import type { ExpressionResult, ExpressionSettings } from "../../expression/models";
 import { computeAlignedPlacement, projectGeometry, projectPoint as projectCompPoint, projectSpawnPoints, toAbsolutePlacement, drawPlacementPreview, DEFAULT_PIANO_PLACEMENT, DEFAULT_ARTWORK_PLACEMENT } from "../../composition/coordinate-transform";
 import type { ArtworkPlacementConfig, PianoPlacementConfig, PlacementAlignX, PlacementAlignY } from "../../composition/coordinate-transform";
-import { normalizeCompositionLayout } from "../../composition/composition-store";
+import { createCompositionLayout, normalizeCompositionLayout } from "../../composition/composition-store";
 import { PianoSynth } from "../../audio/piano-synth";
 import { VisualFxEngine } from "../../fx/fx-engine";
 import { DEFAULT_VISUAL_FX_CONFIG, type FxAnimationFrame, type VisualFxConfig } from "../../fx/fx-types";
+import { DEFAULT_VIDEO_CROP, DEFAULT_VIDEO_OUTPUT_SETTINGS, normalizeVideoCrop, type VideoCropSettings, type VideoOutputSettings } from "../../video/models";
 
 const views: ViewType[] = ["top", "top-angle", "three-quarter", "side", "custom"];
 const viewLabels: Record<ViewType, string> = { top: "top (از بالا)", "top-angle": "top-angle (زاویه‌ی بالا)", "three-quarter": "three-quarter (سه‌ربعی)", side: "side (از بغل)", custom: "custom (سفارشی)" };
@@ -70,6 +71,9 @@ export function App() {
   const [project] = useState(() => createProject());
   const [referenceFrame, setReferenceFrame] = useState<Asset>(); const [midiAsset, setMidiAsset] = useState<Asset>();
   const [puzzleArtwork, setPuzzleArtwork] = useState<Asset>();
+  const [performerVideo, setPerformerVideo] = useState<Asset>();
+  const [performerVideoStatus, setPerformerVideoStatus] = useState<"empty" | "loading" | "loaded" | "error">("empty");
+  const [performerVideoError, setPerformerVideoError] = useState("");
   const [calibration, setCalibration] = useState<Calibration>(); const calibrationRef = useRef<Calibration | undefined>(undefined); const [geometry, setGeometry] = useState<GeometryResult>();
   const [midi, setMidi] = useState<NormalizedMidi>(); const [mapping, setMapping] = useState<MidiMappingResult>();
   const [referenceStatus, setReferenceStatus] = useState<"empty" | "loading" | "loaded" | "error">("empty"); const [midiStatus, setMidiStatus] = useState<"empty" | "loading" | "loaded" | "error">("empty");
@@ -95,11 +99,19 @@ export function App() {
   const placementPreviewRef = useRef<HTMLCanvasElement>(null);
   const [artworkPlacement, setArtworkPlacement] = useState<ArtworkPlacementConfig>(DEFAULT_ARTWORK_PLACEMENT);
   const artworkPlacementRef = useRef(artworkPlacement);
+  const [videoCrop, setVideoCrop] = useState<VideoCropSettings>(() => normalizeVideoCrop(project.videoCrop));
+  const videoCropRef = useRef(videoCrop);
+  const [outputSettings, setOutputSettings] = useState<VideoOutputSettings>(() => ({ ...DEFAULT_VIDEO_OUTPUT_SETTINGS, ...project.outputSettings }));
+  const DEFAULT_LAYOUT = useMemo(() => createCompositionLayout(outputSettings.width, outputSettings.height), [outputSettings.width, outputSettings.height]);
   const artworkPlacementPreviewRef = useRef<HTMLCanvasElement>(null);
+  const performerVideoPreviewRef = useRef<HTMLCanvasElement>(null);
   // Hidden file inputs for browser fallback (when Electron API is unavailable)
   const refImageInputRef = useRef<HTMLInputElement>(null);
   const artworkImageInputRef = useRef<HTMLInputElement>(null);
   const midiFileInputRef = useRef<HTMLInputElement>(null);
+  const performerVideoPanelRef = useRef<HTMLDivElement | null>(null);
+  const importPerformerVideoRef = useRef<() => void>(() => undefined);
+  const removePerformerVideoRef = useRef<() => void>(() => undefined);
   const hasElectronApi = typeof window !== "undefined" && !!(window as any).pianoPuzzle?.chooseAsset;
 
   // Animation (Phase 6)
@@ -112,6 +124,9 @@ export function App() {
   const lastFxTickTimeRef = useRef(performance.now());
   const pianoBackgroundRef = useRef<Container | null>(null);
   const referenceFrameImageRef = useRef<HTMLImageElement | undefined>(undefined);
+  const performerVideoRef = useRef<HTMLVideoElement | undefined>(undefined);
+  const performerVideoTextureRef = useRef<Texture | undefined>(undefined);
+  const videoCropDragRef = useRef<{ startX: number; startY: number; x: number; y: number } | undefined>(undefined);
 
   // MIDI Recording
   const recorderRef = useRef(new MidiRecorder());
@@ -151,7 +166,7 @@ export function App() {
   const fxSettingsRef = useRef(fxSettings);
   const customPresetsRef = useRef(customPresets);
 
-  useEffect(() => { referenceFrameRef.current = referenceFrame; calibrationRef.current = calibration; geometryRef.current = geometry; mappingRef.current = mapping; timingRef.current = timingSettings; expressionRef.current = expressionSettings; showPieceBordersRef.current = showPieceBorders; audioEnabledRef.current = audioEnabled; calibZoomRef.current = calibZoom; pianoPlacementRef.current = pianoPlacement; artworkPlacementRef.current = artworkPlacement; fxSettingsRef.current = fxSettings; customPresetsRef.current = customPresets; }, [referenceFrame, calibration, geometry, mapping, timingSettings, expressionSettings, showPieceBorders, audioEnabled, calibZoom, pianoPlacement, artworkPlacement, fxSettings, customPresets]);
+  useEffect(() => { referenceFrameRef.current = referenceFrame; calibrationRef.current = calibration; geometryRef.current = geometry; mappingRef.current = mapping; timingRef.current = timingSettings; expressionRef.current = expressionSettings; showPieceBordersRef.current = showPieceBorders; audioEnabledRef.current = audioEnabled; calibZoomRef.current = calibZoom; pianoPlacementRef.current = pianoPlacement; artworkPlacementRef.current = artworkPlacement; videoCropRef.current = videoCrop; fxSettingsRef.current = fxSettings; customPresetsRef.current = customPresets; }, [referenceFrame, calibration, geometry, mapping, timingSettings, expressionSettings, showPieceBorders, audioEnabled, calibZoom, pianoPlacement, artworkPlacement, videoCrop, fxSettings, customPresets]);
   useEffect(() => { setArtworkPlacement(DEFAULT_ARTWORK_PLACEMENT); }, [puzzleArtwork?.id]);
   // MIDI Recorder setup
   useEffect(() => {
@@ -665,8 +680,51 @@ export function App() {
 
   function rebuildPianoBackground(k: number) {
     const layer = pianoBackgroundRef.current; if (!layer) return;
-    layer.removeChildren();
+    for (const child of layer.removeChildren()) child.destroy({ children: true });
     const region = DEFAULT_LAYOUT.pianoRegion;
+    const video = performerVideoRef.current;
+    const videoTexture = performerVideoTextureRef.current;
+    if (video && videoTexture && video.videoWidth > 0 && video.videoHeight > 0) {
+      const crop = normalizeVideoCrop(videoCropRef.current);
+      const sourceWidth = video.videoWidth;
+      const sourceHeight = video.videoHeight;
+      const scale = Math.max(
+        region.width / (sourceWidth * crop.width),
+        region.height / (sourceHeight * crop.height)
+      ) * k;
+      const sprite = new Sprite(videoTexture);
+      sprite.x = region.x * k + (region.width * k - sourceWidth * crop.width * scale) / 2 - crop.x * sourceWidth * scale;
+      sprite.y = region.y * k + (region.height * k - sourceHeight * crop.height * scale) / 2 - crop.y * sourceHeight * scale;
+      sprite.width = sourceWidth * scale;
+      sprite.height = sourceHeight * scale;
+      sprite.roundPixels = true;
+      sprite.alpha = crop.opacity;
+      const mask = new Graphics()
+        .rect(region.x * k, region.y * k, region.width * k, region.height * k)
+        .fill({ color: 0xffffff });
+      mask.renderable = false;
+      sprite.mask = mask;
+      layer.addChild(sprite);
+      layer.addChild(mask);
+
+      // A faint reference overlay keeps the calibrated key positions visible
+      // while the performer footage is being framed.
+      const refImage = referenceFrameImageRef.current;
+      if (refImage) {
+        const placement = computeAlignedPlacement(refImage.naturalWidth, refImage.naturalHeight, region, pianoPlacementRef.current);
+        const absolutePlacement = toAbsolutePlacement(region, placement);
+        const referenceSprite = new Sprite(Texture.from(refImage));
+        referenceSprite.x = Math.round(absolutePlacement.offsetX * k);
+        referenceSprite.y = Math.round(absolutePlacement.offsetY * k);
+        referenceSprite.width = Math.round(refImage.naturalWidth * absolutePlacement.scale * k);
+        referenceSprite.height = Math.round(refImage.naturalHeight * absolutePlacement.scale * k);
+        referenceSprite.roundPixels = true;
+        referenceSprite.alpha = 0.16;
+        layer.addChild(referenceSprite);
+      }
+      return;
+    }
+
     const refImage = referenceFrameImageRef.current;
     if (refImage) {
       const placement = computeAlignedPlacement(refImage.naturalWidth, refImage.naturalHeight, region, pianoPlacementRef.current);
@@ -735,6 +793,11 @@ export function App() {
     rendererRef.current?.update(frames, puzzleTransformRef.current.k, timingRef.current, clockRef.current.currentTimeMs);
     if (debugLayerRef.current) { const visible = timingRef.current.debugVisible || expressionRef.current.debugVisible; debugLayerRef.current.visible = visible; if (visible) updateDebugOverlay(frames); }
     const currentTimeMs = clockRef.current.currentTimeMs;
+    const performer = performerVideoRef.current;
+    if (performer && performer.readyState >= 2 && clockRef.current.clockState === "playing") {
+      const targetSeconds = Math.max(0, currentTimeMs / 1000);
+      if (Math.abs(performer.currentTime - targetSeconds) > 0.18) performer.currentTime = targetSeconds;
+    }
     const previousAudioTimeMs = lastAudioTimeMsRef.current;
     if (mappingRef.current && currentTimeMs > previousAudioTimeMs) {
       const events = projectedMappingRef.current?.events ?? mappingRef.current.events;
@@ -828,6 +891,7 @@ export function App() {
   useEffect(() => {
     const unsubscribe = clockRef.current.subscribe((timeMs, state) => {
       const now = performance.now();
+      if (state === "completed") performerVideoRef.current?.pause();
       if (state !== "playing" || now - lastUiSync.current > 80) { lastUiSync.current = now; setClockState({ currentTimeMs: timeMs, state }); setDebugFrames(framesRef.current); }
     });
     return () => { unsubscribe(); clockRef.current.dispose(); };
@@ -858,11 +922,11 @@ export function App() {
     framesRef.current = frames;
     rendererRef.current?.update(frames, puzzleTransformRef.current.k, timingRef.current, clockRef.current.currentTimeMs);
     setDebugFrames(frames);
-  }, [mapping, geometry, timingSettings, expressionSettings, midi, puzzleArtwork, referenceFrame, showPieceBorders, artworkPlacement]);
+  }, [mapping, geometry, timingSettings, expressionSettings, midi, puzzleArtwork, referenceFrame, showPieceBorders, artworkPlacement, pianoPlacement, outputSettings.width, outputSettings.height]);
 
   useEffect(() => {
     applyPuzzleTransform();
-  }, [previewTab, pianoPlacement, referenceFrame, calibration]);
+  }, [previewTab, pianoPlacement, referenceFrame, calibration, performerVideo, videoCrop, outputSettings.width, outputSettings.height]);
 
   // Re-compute keyboard glow anchors whenever calibration or placement changes,
   // even if the PixiJS app hasn't called applyPuzzleTransform yet.
@@ -883,7 +947,7 @@ export function App() {
       });
       fxRef.current.getKeyboardGlow().setKeyAnchors(anchors);
     }
-  }, [calibration, pianoPlacement, referenceFrame]);
+  }, [calibration, pianoPlacement, referenceFrame, outputSettings.width, outputSettings.height]);
 
   useEffect(() => {
     if (!midi || geometry || !puzzleArtworkImageRef.current) return;
@@ -901,7 +965,24 @@ export function App() {
     const canvas = placementPreviewRef.current; const image = referenceFrameImageRef.current;
     if (!canvas || !image) return;
     drawPlacementPreview(canvas, image, DEFAULT_LAYOUT.pianoRegion, pianoPlacement);
-  }, [referenceFrame, pianoPlacement]);
+  }, [referenceFrame, pianoPlacement, outputSettings.width, outputSettings.height]);
+
+  useEffect(() => {
+    drawVideoCropPreview();
+    rebuildPianoBackground(puzzleTransformRef.current.k);
+  }, [performerVideo, videoCrop]);
+
+  useEffect(() => {
+    const video = performerVideoRef.current;
+    if (!video) return;
+    const redraw = () => drawVideoCropPreview();
+    video.addEventListener("loadeddata", redraw);
+    video.addEventListener("timeupdate", redraw);
+    return () => {
+      video.removeEventListener("loadeddata", redraw);
+      video.removeEventListener("timeupdate", redraw);
+    };
+  }, [performerVideo]);
 
   useEffect(() => {
     if (!host.current) return;
@@ -959,6 +1040,214 @@ export function App() {
   function handleRefImageFileChange(e: React.ChangeEvent<HTMLInputElement>) { const file = e.target.files?.[0]; if (!file) return; setReferenceStatus("loading"); const reader = new FileReader(); reader.onload = () => void acceptReferenceFrame("", file.name, file.type, String(reader.result), file.size); reader.onerror = () => { setReferenceStatus("error"); setReferenceError("خواندن تصویر ناموفق بود."); }; reader.readAsDataURL(file); e.target.value = ""; }
   function dropReferenceFrame(event: React.DragEvent<HTMLDivElement>) { event.preventDefault(); const file = event.dataTransfer.files[0]; if (!file || !file.type.startsWith("image/")) { setReferenceStatus("error"); setReferenceError("لطفاً یک فایل تصویری PNG/JPG انتخاب کنید."); return; } const reader = new FileReader(); reader.onload = () => void acceptReferenceFrame("", file.name, file.type, String(reader.result), file.size); reader.onerror = () => { setReferenceStatus("error"); setReferenceError("خواندن تصویر ناموفق بود."); }; setReferenceStatus("loading"); reader.readAsDataURL(file); }
   function removeReferenceFrame() { setReferenceFrame(undefined); setReferenceStatus("empty"); setReferenceError(""); setCalibration(undefined); setMapping(undefined); referenceFrameImageRef.current = undefined; setCalibZoom({ scale: 1, panX: 0, panY: 0 }); setPianoPlacement(DEFAULT_PIANO_PLACEMENT); if (pixi.current) { pixi.current.stage.removeChildren(); spriteRef.current = null; overlay.current = new Container(); pixi.current.stage.addChild(overlay.current); } }
+
+  function drawVideoCropPreview() {
+    const canvas = performerVideoPreviewRef.current;
+    const video = performerVideoRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#0a0e1c";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    if (!video || video.videoWidth <= 0 || video.videoHeight <= 0 || video.readyState < 2) {
+      context.fillStyle = "#8993b8";
+      context.font = "12px Segoe UI";
+      context.textAlign = "center";
+      context.fillText("ویدئو را اضافه کنید", canvas.width / 2, canvas.height / 2);
+      return;
+    }
+    const fit = Math.min(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
+    const drawWidth = video.videoWidth * fit;
+    const drawHeight = video.videoHeight * fit;
+    const drawX = (canvas.width - drawWidth) / 2;
+    const drawY = (canvas.height - drawHeight) / 2;
+    context.drawImage(video, drawX, drawY, drawWidth, drawHeight);
+
+    const crop = normalizeVideoCrop(videoCropRef.current);
+    const cropX = drawX + crop.x * drawWidth;
+    const cropY = drawY + crop.y * drawHeight;
+    const cropWidth = crop.width * drawWidth;
+    const cropHeight = crop.height * drawHeight;
+    context.fillStyle = "rgba(5, 8, 20, 0.62)";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(
+      video,
+      crop.x * video.videoWidth,
+      crop.y * video.videoHeight,
+      crop.width * video.videoWidth,
+      crop.height * video.videoHeight,
+      cropX,
+      cropY,
+      cropWidth,
+      cropHeight
+    );
+    context.strokeStyle = "#55d9ff";
+    context.lineWidth = 2;
+    context.strokeRect(cropX, cropY, cropWidth, cropHeight);
+    context.fillStyle = "#55d9ff";
+    context.font = "10px Segoe UI";
+    context.textAlign = "left";
+    context.fillText("ناحیه‌ی بالای کلاویه", cropX + 5, cropY + 14);
+  }
+
+  function updateVideoCrop(patch: Partial<VideoCropSettings>) {
+    setVideoCrop((current) => normalizeVideoCrop({ ...current, ...patch }));
+  }
+
+  function startVideoCropPan(event: React.PointerEvent<HTMLCanvasElement>) {
+    const canvas = performerVideoPreviewRef.current;
+    const video = performerVideoRef.current;
+    if (!canvas || !video || video.videoWidth <= 0 || video.videoHeight <= 0) return;
+    event.preventDefault();
+    videoCropDragRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      x: videoCropRef.current.x,
+      y: videoCropRef.current.y
+    };
+    canvas.setPointerCapture?.(event.pointerId);
+  }
+
+  function moveVideoCropPan(event: React.PointerEvent<HTMLCanvasElement>) {
+    const canvas = performerVideoPreviewRef.current;
+    const drag = videoCropDragRef.current;
+    if (!canvas || !drag) return;
+    const rect = canvas.getBoundingClientRect();
+    updateVideoCrop({
+      x: drag.x + (event.clientX - drag.startX) / Math.max(1, rect.width),
+      y: drag.y + (event.clientY - drag.startY) / Math.max(1, rect.height)
+    });
+  }
+
+  function endVideoCropPan(event?: React.PointerEvent<HTMLCanvasElement>) {
+    const canvas = performerVideoPreviewRef.current;
+    if (event) canvas?.releasePointerCapture?.(event.pointerId);
+    videoCropDragRef.current = undefined;
+  }
+
+  function acceptPerformerVideo(filePath: string, fileName: string, mimeType: string, dataUrl: string, fileSize: number) {
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.onloadedmetadata = () => {
+      performerVideoTextureRef.current?.destroy(true);
+      performerVideoRef.current = video;
+      performerVideoTextureRef.current = Texture.from(video);
+      const asset: Asset = {
+        id: crypto.randomUUID(),
+        type: "video",
+        fileName,
+        filePath,
+        mimeType: mimeType || "video/mp4",
+        fileSize,
+        width: video.videoWidth,
+        height: video.videoHeight,
+        duration: Number.isFinite(video.duration) ? video.duration : undefined,
+        importedAt: new Date().toISOString(),
+        status: "loaded",
+        dataUrl,
+        role: "performer-video"
+      };
+      setPerformerVideo(asset);
+      setPerformerVideoStatus("loaded");
+      setPerformerVideoError("");
+      setVideoCrop(DEFAULT_VIDEO_CROP);
+      video.currentTime = 0;
+      drawVideoCropPreview();
+      rebuildPianoBackground(puzzleTransformRef.current.k);
+    };
+    video.onerror = () => {
+      setPerformerVideoStatus("error");
+      setPerformerVideoError("فایل ویدئوی نوازنده معتبر نیست یا مرورگر نتوانست آن را پخش کند.");
+    };
+    video.src = dataUrl;
+    video.load();
+  }
+
+  async function importPerformerVideo() {
+    if (hasElectronApi) {
+      setPerformerVideoStatus("loading");
+      setPerformerVideoError("");
+      try {
+        const file = await window.pianoPuzzle?.chooseAsset("video");
+        if (!file) {
+          setPerformerVideoStatus("empty");
+          return;
+        }
+        acceptPerformerVideo(file.filePath, file.fileName, file.mimeType, `data:${file.mimeType};base64,${file.dataBase64}`, file.fileSize);
+      } catch (caught) {
+        setPerformerVideoStatus("error");
+        setPerformerVideoError(caught instanceof Error ? caught.message : "بارگذاری ویدئوی نوازنده ناموفق بود.");
+      }
+    } else {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "video/mp4,video/webm,video/quicktime,video/*";
+      input.onchange = () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        setPerformerVideoStatus("loading");
+        setPerformerVideoError("");
+        const reader = new FileReader();
+        reader.onload = () => acceptPerformerVideo("", file.name, file.type || "video/mp4", String(reader.result), file.size);
+        reader.onerror = () => {
+          setPerformerVideoStatus("error");
+          setPerformerVideoError("خواندن فایل ویدئوی نوازنده ناموفق بود.");
+        };
+        reader.readAsDataURL(file);
+      };
+      input.click();
+    }
+  }
+
+  function handlePerformerVideoFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPerformerVideoStatus("loading");
+    setPerformerVideoError("");
+    const reader = new FileReader();
+    reader.onload = () => acceptPerformerVideo("", file.name, file.type || "video/mp4", String(reader.result), file.size);
+    reader.onerror = () => {
+      setPerformerVideoStatus("error");
+      setPerformerVideoError("خواندن فایل ویدئوی نوازنده ناموفق بود.");
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  }
+
+  function dropPerformerVideo(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const file = event.dataTransfer.files[0];
+    if (!file || !file.type.startsWith("video/")) {
+      setPerformerVideoStatus("error");
+      setPerformerVideoError("لطفاً یک فایل ویدئویی MP4، MOV یا WebM انتخاب کنید.");
+      return;
+    }
+    setPerformerVideoStatus("loading");
+    const reader = new FileReader();
+    reader.onload = () => acceptPerformerVideo("", file.name, file.type, String(reader.result), file.size);
+    reader.onerror = () => {
+      setPerformerVideoStatus("error");
+      setPerformerVideoError("خواندن فایل ویدئوی نوازنده ناموفق بود.");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function removePerformerVideo() {
+    performerVideoRef.current?.pause();
+    performerVideoRef.current?.removeAttribute("src");
+    performerVideoRef.current?.load();
+    performerVideoTextureRef.current?.destroy(true);
+    performerVideoTextureRef.current = undefined;
+    performerVideoRef.current = undefined;
+    setPerformerVideo(undefined);
+    setPerformerVideoStatus("empty");
+    setPerformerVideoError("");
+    setVideoCrop(DEFAULT_VIDEO_CROP);
+    rebuildPianoBackground(puzzleTransformRef.current.k);
+  }
 
   async function acceptPuzzleArtwork(filePath: string, fileName: string, mimeType: string, dataUrl: string, fileSize: number) {
     const image = new Image(); image.onload = () => { puzzleArtworkImageRef.current = image; artworkTextureRef.current = Texture.from(image); const a: Asset = { id: crypto.randomUUID(), type: "image", fileName, filePath, mimeType, fileSize, width: image.naturalWidth, height: image.naturalHeight, importedAt: new Date().toISOString(), status: "loaded", dataUrl, role: "puzzle-artwork" }; setPuzzleArtwork(a); setPuzzleArtworkStatus("loaded"); setGeometry(undefined); setMapping(undefined); }; image.onerror = () => { setPuzzleArtworkStatus("error"); setPuzzleArtworkError("فایل تصویر پازل معتبر نیست یا خراب است."); }; image.src = dataUrl;
@@ -1162,10 +1451,12 @@ export function App() {
   function togglePlay() {
     if (clockRef.current.clockState === "playing") {
       clockRef.current.pause();
+      performerVideoRef.current?.pause();
       fxRef.current?.onPause();
     } else {
       audioRef.current.resume();
       clockRef.current.play();
+      void performerVideoRef.current?.play().catch(() => undefined);
       fxRef.current?.onResume();
     }
   }
@@ -1174,6 +1465,7 @@ export function App() {
     previousFrameStateRef.current.clear();
     fxRef.current?.onSeek();
     clockRef.current.seek(ms);
+    if (performerVideoRef.current && Number.isFinite(ms)) performerVideoRef.current.currentTime = Math.max(0, ms / 1000);
   }
   function stopPlayback() {
     lastAudioTimeMsRef.current = 0;
@@ -1181,6 +1473,8 @@ export function App() {
     audioRef.current.stopAll();
     fxRef.current?.reset();
     clockRef.current.stop();
+    performerVideoRef.current?.pause();
+    if (performerVideoRef.current) performerVideoRef.current.currentTime = 0;
   }
   function resetPlayback() {
     lastAudioTimeMsRef.current = 0;
@@ -1188,6 +1482,8 @@ export function App() {
     audioRef.current.stopAll();
     fxRef.current?.reset();
     clockRef.current.reset();
+    performerVideoRef.current?.pause();
+    if (performerVideoRef.current) performerVideoRef.current.currentTime = 0;
   }
   function setSpeed(speed: number) { clockRef.current.setSpeed(speed); setTimingSettings((prev) => ({ ...prev, animationSpeed: speed })); }
   function updateVelocitySettings(patch: Partial<ExpressionSettings["velocity"]>) { setExpressionSettings((prev) => ({ ...prev, velocity: { ...prev.velocity, ...patch } })); }
@@ -1211,13 +1507,177 @@ export function App() {
     </div>;
   }
 
+  useEffect(() => {
+    importPerformerVideoRef.current = importPerformerVideo;
+    removePerformerVideoRef.current = removePerformerVideo;
+  }, [hasElectronApi, outputSettings.width, outputSettings.height]);
+
+  useEffect(() => {
+    const sidebar = document.querySelector<HTMLElement>(".sidebar");
+    if (!sidebar) return;
+    const panel = document.createElement("div");
+    panel.className = "asset-card performer-video-panel";
+    panel.dataset.performerVideoPanel = "true";
+    panel.innerHTML = `
+      <div class="asset-card-status" data-video-status>— ویدئویی بارگذاری نشده</div>
+      <strong>Performer Video (ویدئوی نواختن نوازنده)</strong>
+      <small>ویدئوی واقعی نوازنده را وارد کن؛ در ناحیه‌ی پیانو نمایش داده می‌شود و جلوه‌ها روی آن قرار می‌گیرند.</small>
+      <video class="asset-card-video" data-video-preview muted controls playsinline preload="metadata" hidden></video>
+      <small data-video-meta></small>
+      <p class="error-message" data-video-error hidden></p>
+      <div class="control-row">
+        <button class="ghost-button" type="button" data-video-action="import">افزودن ویدئو</button>
+        <button class="ghost-button" type="button" data-video-action="remove" hidden>حذف</button>
+      </div>
+      <div class="video-crop-panel" data-video-crop-controls hidden>
+        <h3 class="subheading">Keyboard Crop (برش محدوده‌ی بالای کلاویه)</h3>
+        <small class="anchor-hint">کادر روشن را روی بخشی از ویدئو بکش؛ این بخش داخل ناحیه‌ی پیانو قرار می‌گیرد تا مسیر حرکت جلوه‌ها واضح بماند.</small>
+        <canvas class="density-preview video-crop-preview" data-video-crop-preview width="232" height="150"></canvas>
+        <label class="range-label">Crop X (موقعیت افقی) <output data-video-value="x">0%</output></label>
+        <input type="range" min="0" max="100" step="1" data-video-crop="x">
+        <label class="range-label">Crop Y (موقعیت عمودی) <output data-video-value="y">0%</output></label>
+        <input type="range" min="0" max="100" step="1" data-video-crop="y">
+        <label class="range-label">Crop width (عرض برش) <output data-video-value="width">100%</output></label>
+        <input type="range" min="5" max="100" step="1" data-video-crop="width">
+        <label class="range-label">Crop height (ارتفاع برش) <output data-video-value="height">100%</output></label>
+        <input type="range" min="5" max="100" step="1" data-video-crop="height">
+        <label class="range-label">Video opacity (شفافیت ویدئو) <output data-video-value="opacity">82%</output></label>
+        <input type="range" min="10" max="100" step="1" data-video-crop="opacity">
+        <button class="ghost-button mapping-button" type="button" data-video-action="reset">Reset crop (بازنشانی برش)</button>
+      </div>`;
+
+    const preview = panel.querySelector<HTMLVideoElement>("[data-video-preview]");
+    const canvas = panel.querySelector<HTMLCanvasElement>("[data-video-crop-preview]");
+    const importButton = panel.querySelector<HTMLButtonElement>('[data-video-action="import"]');
+    const removeButton = panel.querySelector<HTMLButtonElement>('[data-video-action="remove"]');
+    const controls = panel.querySelector<HTMLElement>("[data-video-crop-controls]");
+    const resetButton = panel.querySelector<HTMLButtonElement>('[data-video-action="reset"]');
+    if (canvas) performerVideoPreviewRef.current = canvas;
+
+    const onImport = () => importPerformerVideoRef.current();
+    const onRemove = () => removePerformerVideoRef.current();
+    const onReset = () => setVideoCrop(DEFAULT_VIDEO_CROP);
+    const onDragOver = (event: DragEvent) => event.preventDefault();
+    const onDrop = (event: DragEvent) => {
+      event.preventDefault();
+      const file = event.dataTransfer?.files[0];
+      if (!file || !file.type.startsWith("video/")) {
+        setPerformerVideoStatus("error");
+        setPerformerVideoError("لطفاً یک فایل ویدئویی MP4، MOV یا WebM انتخاب کنید.");
+        return;
+      }
+      setPerformerVideoStatus("loading");
+      const reader = new FileReader();
+      reader.onload = () => acceptPerformerVideo("", file.name, file.type, String(reader.result), file.size);
+      reader.onerror = () => {
+        setPerformerVideoStatus("error");
+        setPerformerVideoError("خواندن فایل ویدئوی نوازنده ناموفق بود.");
+      };
+      reader.readAsDataURL(file);
+    };
+    const onInput = (event: Event) => {
+      const control = event.target as HTMLInputElement;
+      const key = control.dataset.videoCrop as keyof VideoCropSettings | undefined;
+      if (!key) return;
+      const value = Number(control.value) / 100;
+      updateVideoCrop({ [key]: value });
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      startVideoCropPan(event as unknown as React.PointerEvent<HTMLCanvasElement>);
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      moveVideoCropPan(event as unknown as React.PointerEvent<HTMLCanvasElement>);
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      endVideoCropPan(event as unknown as React.PointerEvent<HTMLCanvasElement>);
+    };
+
+    importButton?.addEventListener("click", onImport);
+    removeButton?.addEventListener("click", onRemove);
+    resetButton?.addEventListener("click", onReset);
+    panel.addEventListener("dragover", onDragOver);
+    panel.addEventListener("drop", onDrop);
+    panel.addEventListener("input", onInput);
+    canvas?.addEventListener("pointerdown", onPointerDown);
+    canvas?.addEventListener("pointermove", onPointerMove);
+    canvas?.addEventListener("pointerup", onPointerUp);
+    canvas?.addEventListener("pointercancel", onPointerUp);
+    sidebar.appendChild(panel);
+    performerVideoPanelRef.current = panel;
+
+    return () => {
+      importButton?.removeEventListener("click", onImport);
+      removeButton?.removeEventListener("click", onRemove);
+      resetButton?.removeEventListener("click", onReset);
+      panel.removeEventListener("dragover", onDragOver);
+      panel.removeEventListener("drop", onDrop);
+      panel.removeEventListener("input", onInput);
+      canvas?.removeEventListener("pointerdown", onPointerDown);
+      canvas?.removeEventListener("pointermove", onPointerMove);
+      canvas?.removeEventListener("pointerup", onPointerUp);
+      canvas?.removeEventListener("pointercancel", onPointerUp);
+      if (performerVideoPreviewRef.current === canvas) performerVideoPreviewRef.current = null;
+      if (performerVideoPanelRef.current === panel) performerVideoPanelRef.current = null;
+      panel.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const panel = performerVideoPanelRef.current;
+    if (!panel) return;
+    const status = panel.querySelector<HTMLElement>("[data-video-status]");
+    const preview = panel.querySelector<HTMLVideoElement>("[data-video-preview]");
+    const meta = panel.querySelector<HTMLElement>("[data-video-meta]");
+    const error = panel.querySelector<HTMLElement>("[data-video-error]");
+    const importButton = panel.querySelector<HTMLButtonElement>('[data-video-action="import"]');
+    const removeButton = panel.querySelector<HTMLButtonElement>('[data-video-action="remove"]');
+    const controls = panel.querySelector<HTMLElement>("[data-video-crop-controls]");
+
+    panel.classList.toggle("asset-card-loaded", Boolean(performerVideo));
+    if (status) status.textContent = performerVideo ? "✓ ویدئوی نوازنده آماده است" : performerVideoStatus === "loading" ? "⏳ در حال خواندن ویدئو..." : "— ویدئویی بارگذاری نشده";
+    if (preview) {
+      if (performerVideo?.dataUrl) {
+        if (preview.src !== performerVideo.dataUrl) preview.src = performerVideo.dataUrl;
+        preview.hidden = false;
+      } else {
+        preview.pause();
+        preview.removeAttribute("src");
+        preview.load();
+        preview.hidden = true;
+      }
+    }
+    if (meta) meta.textContent = performerVideo ? `${performerVideo.fileName} · ${performerVideo.width}×${performerVideo.height}${performerVideo.duration ? ` · ${Math.round(performerVideo.duration)}s` : ""}` : "";
+    if (error) {
+      error.textContent = performerVideoError;
+      error.hidden = !performerVideoError;
+    }
+    if (importButton) importButton.textContent = performerVideo ? "جایگزینی ویدئو" : "افزودن ویدئو";
+    if (removeButton) removeButton.hidden = !performerVideo;
+    if (controls) controls.hidden = !performerVideo;
+
+    const cropControls = panel.querySelectorAll<HTMLInputElement>("[data-video-crop]");
+    cropControls.forEach((control) => {
+      const key = control.dataset.videoCrop as keyof VideoCropSettings;
+      const value = videoCrop[key];
+      control.value = String(Math.round(Number(value) * 100));
+      if (key === "x") control.max = String(Math.round((1 - videoCrop.width) * 100));
+      if (key === "y") control.max = String(Math.round((1 - videoCrop.height) * 100));
+    });
+    panel.querySelectorAll<HTMLOutputElement>("[data-video-value]").forEach((output) => {
+      const key = output.dataset.videoValue as keyof VideoCropSettings;
+      output.textContent = `${Math.round(Number(videoCrop[key]) * 100)}%`;
+    });
+    drawVideoCropPreview();
+  }, [performerVideo, performerVideoStatus, performerVideoError, videoCrop]);
+
   const workflowSteps = [
     { label: "۱. تصویر مرجع پیانو (Reference Frame)", done: hasReferenceFrame },
-    { label: "۲. کالیبراسیون (Calibration)", done: hasValidCalibration },
-    { label: "۳. تصویر پازل (Puzzle Artwork)", done: hasPuzzleArtwork },
-    { label: "۴. ساخت قطعات (Generate Pieces)", done: hasGeneratedPieces },
-    { label: "۵. فایل MIDI", done: hasMidi },
-    { label: "۶. اجرای نگاشت (Run Mapping)", done: Boolean(mapping) }
+    { label: "۲. ویدئوی نوازنده (Performer Video)", done: Boolean(performerVideo) },
+    { label: "۳. کالیبراسیون (Calibration)", done: hasValidCalibration },
+    { label: "۴. تصویر پازل (Puzzle Artwork)", done: hasPuzzleArtwork },
+    { label: "۵. ساخت قطعات (Generate Pieces)", done: hasGeneratedPieces },
+    { label: "۶. فایل MIDI", done: hasMidi },
+    { label: "۷. اجرای نگاشت (Run Mapping)", done: Boolean(mapping) }
   ];
 
   const totalPieces = geometry?.pieces.length ?? 0;
