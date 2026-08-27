@@ -10,7 +10,7 @@ import { createOverlaySvg } from "../../keyboard/overlay-generator";
 import { loadCalibrations, saveCalibrationWithTimestamp } from "../../keyboard/calibration-store";
 import { calibrationIsValid, createDefaultCalibration, migrateCalibration, updateAnchorDiagnostics, viewTransform } from "../../keyboard/calibration-workflow";
 import { isValidQuadrilateral } from "../../keyboard/homography";
-import { anchorReferencePoint, baseProject, computeCornerHomography, buildKeyProjectionContext, projectKeySpawn } from "../../keyboard/key-projection";
+import { anchorReferencePoint, baseProject, computeCornerHomography, buildKeyProjectionContext, projectKeyTopEdge } from "../../keyboard/key-projection";
 import { computeViewProjection, toSourcePoint, toViewPoint } from "../../keyboard/view-projection";
 import { parseMidi } from "../../midi/parser";
 import { mapMidiToPuzzle } from "../../midi/note-mapper";
@@ -57,7 +57,6 @@ const geometryModes: GeometryMode[] = ["grid", "voronoi", "delaunay", "hybrid"];
 const geometryModeLabels: Record<GeometryMode, string> = { grid: "Grid (شبکه‌ای)", voronoi: "Voronoi", delaunay: "Delaunay", hybrid: "Hybrid (ترکیبی)" };
 const DEFAULT_LAYOUT = normalizeCompositionLayout();
 const EMPTY_GEOMETRY: GeometryResult = { mode: "grid", width: 0, height: 0, pieces: [], importanceMap: { width: 0, height: 0, values: [], average: 0 } };
-const WHITE_PIANO_KEYS = createPianoLayout("88-key").filter((key) => key.keyType === "white");
 
 function formatTime(ms: number): string {
   const clamped = Math.max(0, Math.floor(ms));
@@ -812,8 +811,9 @@ export function App() {
       pianoPlacementRef.current
     );
     const keyContext = buildKeyProjectionContext(calibrationValue);
-    const anchors = WHITE_PIANO_KEYS.map((key) => {
-      const sourcePoint = projectKeySpawn(calibrationValue, key, keyContext);
+    const whiteKeys = calibrationValue.keyMap.filter((key) => key.keyType === "white");
+    const anchors = whiteKeys.map((key) => {
+      const sourcePoint = projectKeyTopEdge(calibrationValue, key, keyContext);
       const topPoint = projectCompPoint(sourcePoint, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
       return {
         midiNote: key.midiNote,

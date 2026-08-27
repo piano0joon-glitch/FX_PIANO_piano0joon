@@ -365,7 +365,8 @@ export class VisualFxEngine {
       }
     }
 
-    // Fake glow lines removed - now handled exclusively by KeyboardGlowController    this.demoLayer.addChild(keyboard);
+    // Glow lines are handled exclusively by KeyboardGlowController.
+    this.demoLayer.addChild(keyboard);
     this.demoKeyboard = keyboard;
   }
 

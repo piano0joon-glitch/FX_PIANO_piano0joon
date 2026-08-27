@@ -133,6 +133,20 @@ export function projectKeyCenter(calibration: Calibration, key: PianoKey, ctx: K
   return bounds ? { x: (bounds.left + bounds.right) / 2, y: base.y } : base;
 }
 
+/**
+ * Project the physical top edge of a key.
+ *
+ * The animation spawn point intentionally sits slightly above the key so a
+ * piece can enter the composition cleanly. A keyboard glow bar, however,
+ * must be anchored to the actual top edge; using the spawn point makes the
+ * horizontal line visibly float away from the keyboard.
+ */
+export function projectKeyTopEdge(calibration: Calibration, key: PianoKey, ctx: KeyProjectionContext): Point {
+  const base = projectPoint(calibration, key.topEdge, ctx.corrections);
+  const bounds = ctx.manualBoundsX.get(key.midiNote);
+  return bounds ? { x: (bounds.left + bounds.right) / 2, y: base.y } : base;
+}
+
 export function projectKeySpawn(calibration: Calibration, key: PianoKey, ctx: KeyProjectionContext): Point {
   const base = projectPoint(calibration, key.spawnPoint, ctx.corrections);
   const bounds = ctx.manualBoundsX.get(key.midiNote);
