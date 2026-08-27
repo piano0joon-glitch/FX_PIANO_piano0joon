@@ -1,4 +1,4 @@
-import { Container, Sprite, Texture } from "pixi.js";
+import { Container, Texture } from "pixi.js";
 import type { Point } from "../geometry/models";
 import type { FxTextureId } from "./fx-asset-types";
 import type { FxAssetPipeline } from "./asset-pipeline";
@@ -6,9 +6,12 @@ import {
   clamp,
   FxSmokeBehavior,
   FxSmokeLayer,
-  MAX_ACTIVE_SMOKE,
-  smoothstep
+  MAX_ACTIVE_SMOKE
 } from "./fx-types";
+import {
+  GpuParticleBatch,
+  type GpuParticleSpawn
+} from "./gpu-particle-batch";
 import { SeededRandom } from "./seeded-random";
 
 interface SmokeLayerProfile {
@@ -69,58 +72,37 @@ const TEXTURES_BY_LAYER: Record<FxSmokeLayer, readonly FxTextureId[]> = {
   residue: ["smoke-wisp-01", "smoke-cloud-01"]
 };
 
-interface SmokeState {
-  active: boolean;
-  layer: FxSmokeLayer;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  age: number;
-  lifetime: number;
-  alpha: number;
-  baseAlpha: number;
-  scale: number;
-  baseScale: number;
-  radius: number;
-  color: number;
-  seed: number;
-  phase: number;
-  flowPhase: number;
-  flowStrength: number;
-  depth: number;
-  rotation: number;
-  spin: number;
-  drag: number;
-  turbulence: number;
-  turbulenceFrequency: number;
-  rise: number;
-  fadeInEnd: number;
-  fadeOutStart: number;
-  flipX: boolean;
-  textureId: FxTextureId;
-  textureExtent: number;
-}
+const GPU_BATCH_CAPACITY = 128;
 
-interface SmokeSlot {
-  state: SmokeState;
-  visual: Sprite;
+interface SmokeBatchEntry {
+  layer: FxSmokeLayer;
+  textureId: FxTextureId;
+  batch: GpuParticleBatch;
 }
 
 /**
- * Fixed-capacity, preallocated Sprite pool for layered smoke. All visual
- * instances are created once in the constructor and reused by acquire().
+ * GPU-backed layered smoke pool.
+ *
+ * Smoke motion, breathing, growth and alpha curves are evaluated in the same
+ * particle vertex shader used by the ember/spark pool. This removes the
+ * previous O(MAX_ACTIVE_SMOKE) Sprite update loop from the render ticker.
  */
 export class SmokeController {
   readonly layer = new Container();
-  private readonly slots: SmokeSlot[] = [];
+
   private readonly maxPuffs: number;
+  private readonly batches = new Map<string, SmokeBatchEntry[]>();
   private texturePipeline: FxAssetPipeline | undefined;
   private random = new SeededRandom("piano-puzzle-smoke");
-  private nextSlotIndex = 0;
+  private currentTimeSeconds = 0;
+  private allocatedSlots = 0;
   private activePuffs = 0;
   private droppedPuffs = 0;
-  private readonly activeByLayer: Record<FxSmokeLayer, number> = { core: 0, volume: 0, residue: 0 };
+  private readonly activeByLayer: Record<FxSmokeLayer, number> = {
+    core: 0,
+    volume: 0,
+    residue: 0
+  };
   private readonly lastTextureByLayer: Record<FxSmokeLayer, FxTextureId | undefined> = {
     core: undefined,
     volume: undefined,
@@ -130,47 +112,6 @@ export class SmokeController {
   constructor(maxPuffs = MAX_ACTIVE_SMOKE) {
     this.layer.sortableChildren = true;
     this.maxPuffs = Math.max(1, Math.min(MAX_ACTIVE_SMOKE, Math.floor(maxPuffs)));
-    for (let i = 0; i < this.maxPuffs; i += 1) {
-      const visual = new Sprite(Texture.WHITE);
-      visual.anchor.set(0.5);
-      visual.visible = false;
-      this.layer.addChild(visual);
-      this.slots.push({
-        state: {
-          active: false,
-          layer: "volume",
-          x: 0,
-          y: 0,
-          vx: 0,
-          vy: 0,
-          age: 0,
-          lifetime: 0,
-          alpha: 0,
-          baseAlpha: 0,
-          scale: 0,
-          baseScale: 1,
-          radius: 1,
-          color: 0xffffff,
-          seed: 0,
-          phase: 0,
-          flowPhase: 0,
-          flowStrength: 1,
-          depth: 1,
-          rotation: 0,
-          spin: 0,
-          drag: 1,
-          turbulence: 0,
-          turbulenceFrequency: 1,
-          rise: 0,
-          fadeInEnd: 0.12,
-          fadeOutStart: 0.55,
-          flipX: false,
-          textureId: "smoke-cloud-01",
-          textureExtent: 128
-        },
-        visual
-      });
-    }
   }
 
   setTexturePipeline(pipeline: FxAssetPipeline): void {
@@ -196,20 +137,10 @@ export class SmokeController {
     dragMultiplier = 1,
     turbulenceMultiplier = 1,
     behaviorMultiplier = 1
-  ): SmokeState | undefined {
-    let slot: SmokeSlot | undefined;
-    for (let offset = 0; offset < this.slots.length; offset += 1) {
-      const index = (this.nextSlotIndex + offset) % this.slots.length;
-      const candidate = this.slots[index];
-      if (!candidate.state.active) {
-        slot = candidate;
-        this.nextSlotIndex = (index + 1) % this.slots.length;
-        break;
-      }
-    }
-    if (!slot) {
+  ): boolean {
+    if (this.activePuffs >= this.maxPuffs) {
       this.droppedPuffs += 1;
-      return undefined;
+      return false;
     }
 
     const profile = LAYER_PROFILES[layer];
@@ -218,114 +149,116 @@ export class SmokeController {
     const behaviorDrag = behavior === "bass" ? 1.22 : behavior === "high" ? 0.78 : 1;
     const behaviorTurbulence = behavior === "bass" ? 0.72 : behavior === "high" ? 1.4 : 1;
     const behaviorRise = behavior === "bass" ? 0.62 : behavior === "high" ? 1.32 : 1;
-    const state = slot.state;
-
-    state.active = true;
-    state.layer = layer;
-    state.x = position.x;
-    state.y = position.y;
-    state.vx = velocity.x;
-    state.vy = velocity.y;
-    state.age = 0;
-    state.lifetime = Math.max(120, lifetime * profile.lifetimeMultiplier * behaviorLifetime * this.random.range(0.86, 1.18));
-    state.radius = Math.max(2, radius);
-    state.baseAlpha = clamp(alpha * profile.alphaMultiplier * behaviorMultiplier * this.random.range(0.9, 1.12));
-    state.alpha = state.baseAlpha;
-    state.color = color;
-    state.seed = this.random.range(0, Math.PI * 2);
-    state.phase = this.random.range(0, Math.PI * 2);
-    state.flowPhase = this.random.range(0, Math.PI * 2);
-    state.flowStrength = this.random.range(0.72, 1.24);
-    state.depth = this.random.range(0.72, 1.28);
-    state.rotation = this.random.range(0, Math.PI * 2);
-    state.spin = this.random.signed(profile.spin);
-    state.drag = profile.drag * behaviorDrag * dragMultiplier * this.random.range(0.88, 1.14);
-    state.turbulence = profile.turbulence * behaviorTurbulence * turbulenceMultiplier * this.random.range(0.86, 1.18);
-    state.turbulenceFrequency = profile.turbulenceFrequency * this.random.range(0.88, 1.12);
-    state.rise = profile.rise * behaviorRise * this.random.range(0.86, 1.16);
-    state.fadeInEnd = profile.fadeInEnd;
-    state.fadeOutStart = profile.fadeOutStart;
-    state.flipX = this.random.nextFloat() > 0.5;
-    state.textureId = this.pickTexture(layer);
-
-    slot.visual.texture = this.texturePipeline?.getTexture(state.textureId) ?? Texture.WHITE;
-    state.textureExtent = Math.max(1, slot.visual.texture.width, slot.visual.texture.height);
-    state.baseScale = Math.max(
-      0.01,
-      state.radius * 2 / state.textureExtent * profile.scaleMultiplier * behaviorScale * behaviorMultiplier * this.random.range(0.86, 1.18)
+    const lifetimeMs = Math.max(
+      120,
+      lifetime * profile.lifetimeMultiplier * behaviorLifetime * this.random.range(0.86, 1.18)
     );
-    state.scale = state.baseScale;
-    if (state.textureId === "smoke-wisp-01") {
-      state.rotation = Math.atan2(velocity.y, velocity.x) + Math.PI * 0.5 + this.random.signed(0.42);
-    } else if (state.textureId === "smoke-cloud-01") {
-      state.rotation = this.random.range(0, Math.PI * 2);
+    const baseAlpha = clamp(
+      alpha * profile.alphaMultiplier * behaviorMultiplier * this.random.range(0.9, 1.12)
+    );
+    const textureId = this.pickTexture(layer);
+    const texture = this.texturePipeline?.getTexture(textureId) ?? Texture.WHITE;
+    const textureExtent = Math.max(1, texture.width, texture.height);
+    const baseScale = Math.max(
+      0.01,
+      radius * 2 / textureExtent
+        * profile.scaleMultiplier
+        * behaviorScale
+        * behaviorMultiplier
+        * this.random.range(0.86, 1.18)
+    );
+    let rotation = this.random.range(0, Math.PI * 2);
+    if (textureId === "smoke-wisp-01") {
+      rotation = Math.atan2(velocity.y, velocity.x) + Math.PI * 0.5 + this.random.signed(0.42);
     }
-    slot.visual.position.set(state.x, state.y);
-    slot.visual.rotation = state.rotation;
-    slot.visual.scale.set(state.flipX ? -state.scale : state.scale, state.scale);
-    slot.visual.tint = state.color;
-    slot.visual.alpha = state.alpha;
-    slot.visual.blendMode = layer === "volume" ? "normal" : "screen";
-    slot.visual.zIndex = layer === "core" ? 1 : layer === "volume" ? 2 : 3;
-    slot.visual.visible = true;
+
+    const spawn: GpuParticleSpawn = {
+      x: position.x,
+      y: position.y,
+      vx: velocity.x,
+      vy: velocity.y,
+      lifetimeSeconds: lifetimeMs / 1000,
+      baseScale,
+      rotation,
+      spin: this.random.signed(profile.spin),
+      phase: this.random.range(0, Math.PI * 2),
+      drag: profile.drag * behaviorDrag * dragMultiplier * this.random.range(0.88, 1.14),
+      turbulence: profile.turbulence * behaviorTurbulence * turbulenceMultiplier * this.random.range(0.86, 1.18),
+      turbulenceFrequency: profile.turbulenceFrequency * this.random.range(0.88, 1.12),
+      rise: profile.rise * behaviorRise * this.random.range(0.86, 1.16),
+      fadeInEnd: profile.fadeInEnd,
+      fadeOutStart: profile.fadeOutStart,
+      baseAlpha,
+      color,
+      endColor: color,
+      colorShift: 0,
+      flipX: this.random.nextFloat() > 0.5,
+      mode: "smoke",
+      depth: this.random.range(0.72, 1.28)
+    };
+
+    const key = `${layer}:${textureId}`;
+    const entries = this.batches.get(key) ?? [];
+    this.batches.set(key, entries);
+
+    let accepted = false;
+    for (const entry of entries) {
+      entry.batch.setTexture(texture);
+      if (entry.batch.spawn(this.currentTimeSeconds, spawn)) {
+        accepted = true;
+        break;
+      }
+    }
+
+    if (!accepted && this.allocatedSlots < this.maxPuffs) {
+      const capacity = Math.min(GPU_BATCH_CAPACITY, this.maxPuffs - this.allocatedSlots);
+      const batch = new GpuParticleBatch(
+        capacity,
+        texture,
+        layer === "volume" ? "normal" : "screen",
+        layer === "core" ? 1 : layer === "volume" ? 2 : 3
+      );
+      this.layer.addChild(batch.mesh);
+      entries.push({ layer, textureId, batch });
+      this.allocatedSlots += capacity;
+      accepted = batch.spawn(this.currentTimeSeconds, spawn);
+    }
+
+    if (!accepted) {
+      this.droppedPuffs += 1;
+      return false;
+    }
+
     this.activePuffs += 1;
     this.activeByLayer[layer] += 1;
-    return state;
+    return true;
   }
 
   update(deltaSeconds: number): void {
-    const delta = Math.min(0.05, Math.max(0, deltaSeconds));
-    for (const slot of this.slots) {
-      const state = slot.state;
-      if (!state.active) continue;
-      state.age += delta * 1000;
-      if (state.age >= state.lifetime) {
-        this.release(slot);
-        continue;
+    this.currentTimeSeconds += Math.min(0.1, Math.max(0, deltaSeconds));
+    for (const entries of this.batches.values()) {
+      for (const entry of entries) {
+        entry.batch.update(this.currentTimeSeconds);
+        entry.batch.flush();
       }
-
-      const progress = state.age / state.lifetime;
-      const turbulenceX = Math.sin(state.phase + progress * state.turbulenceFrequency * 6.28318) * state.turbulence;
-      const turbulenceY = Math.cos(state.seed * 1.37 + progress * state.turbulenceFrequency * 5.1) * state.turbulence * 0.72;
-      const spatialX = state.x * 0.008 + state.seed * 3.7 + state.age * 0.00042;
-      const spatialY = state.y * 0.009 + state.flowPhase * 2.1 - state.age * 0.00031;
-      const curlX = (Math.sin(spatialY) * 0.7 + Math.cos(spatialX * 1.31) * 0.3) * state.flowStrength * state.turbulence;
-      const curlY = (Math.cos(spatialX) * 0.68 - Math.sin(spatialY * 1.17) * 0.32) * state.flowStrength * state.turbulence;
-      const drag = Math.exp(-state.drag * delta);
-      state.vx = state.vx * drag + (turbulenceX + curlX * 0.9) * delta;
-      state.vy = state.vy * drag + (turbulenceY + curlY * 0.82) * delta - state.rise * delta;
-      state.x += state.vx * delta;
-      state.y += state.vy * delta;
-
-      const fadeIn = smoothstep(0, state.fadeInEnd, progress);
-      const fadeOut = 1 - smoothstep(state.fadeOutStart, 1, progress);
-      const alphaCurve = Math.pow(Math.max(0, fadeIn * fadeOut), 0.68);
-      const growth = 0.68 + progress * 1.62;
-      const breathing = 1 + Math.sin(state.phase + progress * 5.2) * 0.1 + Math.sin(state.flowPhase + progress * 2.6) * 0.05;
-      state.scale = state.baseScale * growth * breathing * (0.94 + state.depth * 0.06);
-      state.alpha = state.baseAlpha * alphaCurve * (0.94 + Math.sin(state.flowPhase + progress * 2.8) * 0.06);
-      state.rotation += state.spin * delta;
-
-      slot.visual.position.set(state.x, state.y);
-      slot.visual.scale.set(state.flipX ? -state.scale : state.scale, state.scale);
-      slot.visual.rotation = state.rotation;
-      slot.visual.alpha = state.alpha;
-      slot.visual.tint = state.color;
     }
+    this.syncCounts();
+  }
+
+  flush(): void {
+    for (const entries of this.batches.values()) {
+      for (const entry of entries) entry.batch.flush();
+    }
+    this.syncCounts();
   }
 
   clear(): void {
-    for (const slot of this.slots) {
-      slot.state.active = false;
-      slot.state.age = 0;
-      slot.state.alpha = 0;
-      slot.state.scale = 0;
-      slot.visual.visible = false;
-      slot.visual.alpha = 0;
+    for (const entries of this.batches.values()) {
+      for (const entry of entries) entry.batch.clear();
     }
+    this.currentTimeSeconds = 0;
     this.activePuffs = 0;
     this.droppedPuffs = 0;
-    this.nextSlotIndex = 0;
     this.activeByLayer.core = 0;
     this.activeByLayer.volume = 0;
     this.activeByLayer.residue = 0;
@@ -355,8 +288,11 @@ export class SmokeController {
   }
 
   dispose(): void {
-    this.clear();
-    this.layer.destroy({ children: true });
+    for (const entries of this.batches.values()) {
+      for (const entry of entries) entry.batch.destroy();
+    }
+    this.batches.clear();
+    this.layer.destroy({ children: false });
   }
 
   private pickTexture(layer: FxSmokeLayer): FxTextureId {
@@ -369,16 +305,18 @@ export class SmokeController {
     return textureId;
   }
 
-  private release(slot: SmokeSlot): void {
-    const state = slot.state;
-    if (!state.active) return;
-    state.active = false;
-    state.age = 0;
-    state.alpha = 0;
-    state.scale = 0;
-    this.activePuffs = Math.max(0, this.activePuffs - 1);
-    this.activeByLayer[state.layer] = Math.max(0, this.activeByLayer[state.layer] - 1);
-    slot.visual.visible = false;
-    slot.visual.alpha = 0;
+  private syncCounts(): void {
+    let active = 0;
+    this.activeByLayer.core = 0;
+    this.activeByLayer.volume = 0;
+    this.activeByLayer.residue = 0;
+    for (const entries of this.batches.values()) {
+      for (const entry of entries) {
+        const count = entry.batch.activeCount;
+        active += count;
+        this.activeByLayer[entry.layer] += count;
+      }
+    }
+    this.activePuffs = active;
   }
 }

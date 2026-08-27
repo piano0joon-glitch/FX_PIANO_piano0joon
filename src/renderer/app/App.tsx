@@ -907,7 +907,7 @@ export function App() {
     if (!host.current) return;
     const app = new Application(); pixi.current = app; let disposed = false; let initialized = false;
     const onResize = () => applyImageTransform();
-    void app.init({ background: "#111528", resizeTo: host.current, antialias: true }).then(() => {
+    void app.init({ background: "#111528", resizeTo: host.current, antialias: true, preference: "webgl", powerPreference: "high-performance" }).then(() => {
       if (disposed) { app.destroy(true); return; }
       initialized = true;
       if (!host.current) return;
@@ -923,7 +923,7 @@ export function App() {
     if (!puzzleHost.current) return;
     const app = new Application(); puzzlePixi.current = app; let disposed = false; let initialized = false;
     const onResize = () => applyPuzzleTransform();
-    void app.init({ background: "#0c0f1c", resizeTo: puzzleHost.current, antialias: true }).then(() => {
+    void app.init({ background: "#0c0f1c", resizeTo: puzzleHost.current, antialias: true, preference: "webgl", powerPreference: "high-performance" }).then(() => {
       if (disposed) { app.destroy(true); return; }
       initialized = true;
       if (!puzzleHost.current) return;

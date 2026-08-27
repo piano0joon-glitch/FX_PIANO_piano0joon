@@ -572,6 +572,12 @@ export class VisualFxEngine {
     if (this.isGalaxyPreset() && this.config.particlesEnabled) {
       this.updateGalaxy(deltaMs);
     }
+    if (!this.paused) {
+      // Upload only the compact spawn/release changes made during this tick.
+      // Particle motion itself is evaluated by the GPU vertex shader.
+      this.particlePool.flush();
+      this.smokeController.flush();
+    }
     this.updateRibbons(deltaMs);
     this.commitFrameMetrics();
   }
