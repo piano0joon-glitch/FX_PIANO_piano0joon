@@ -18,7 +18,11 @@ app.commandLine.appendSwitch("enable-webgl");
 app.commandLine.appendSwitch("enable-webgl2-compute-context");
 app.commandLine.appendSwitch("enable-accelerated-2d-canvas");
 app.commandLine.appendSwitch("enable-accelerated-video-decode");
-app.commandLine.appendSwitch("use-gl", "desktop"); // Use dedicated GPU GL driver
+// GPU preference switching on Windows is effective through ANGLE/EGL.
+// Desktop GL can keep the renderer attached to the integrated adapter.
+app.commandLine.appendSwitch("use-gl", "angle");
+app.commandLine.appendSwitch("use-angle", "d3d11");
+app.commandLine.appendSwitch("use-cmd-decoder", "passthrough");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
