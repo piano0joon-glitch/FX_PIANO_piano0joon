@@ -90,6 +90,7 @@ export class AmbientDustSystem {
         Math.min(0.9, particle.targetAlpha * (0.8 + this.hitBoost * 0.35))
       );
     }
+    this.pool.flush();
   }
 
   clear(): void {
