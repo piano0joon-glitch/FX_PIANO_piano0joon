@@ -34,7 +34,8 @@ import { createCompositionLayout, normalizeCompositionLayout } from "../../compo
 import { PianoSynth } from "../../audio/piano-synth";
 import { VisualFxEngine } from "../../fx/fx-engine";
 import { DEFAULT_VISUAL_FX_CONFIG, type FxAnimationFrame, type VisualFxConfig } from "../../fx/fx-types";
-import { DEFAULT_VIDEO_CROP, DEFAULT_VIDEO_OUTPUT_SETTINGS, normalizeVideoCrop, type VideoCropSettings, type VideoOutputSettings } from "../../video/models";
+import { bitrateForQuality, DEFAULT_VIDEO_CROP, DEFAULT_VIDEO_OUTPUT_SETTINGS, normalizeVideoCrop, normalizeVideoOutputSettings, VIDEO_OUTPUT_PROFILES, type VideoCropSettings, type VideoOutputSettings } from "../../video/models";
+import { downloadVideoBlob, recordCanvasVideo } from "../../video/video-exporter";
 
 const views: ViewType[] = ["top", "top-angle", "three-quarter", "side", "custom"];
 const viewLabels: Record<ViewType, string> = { top: "top (از بالا)", "top-angle": "top-angle (زاویه‌ی بالا)", "three-quarter": "three-quarter (سه‌ربعی)", side: "side (از بغل)", custom: "custom (سفارشی)" };
@@ -63,6 +64,10 @@ function formatTime(ms: number): string {
   const seconds = Math.floor((clamped % 60000) / 1000);
   const millis = clamped % 1000;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 export function App() {
@@ -101,7 +106,8 @@ export function App() {
   const artworkPlacementRef = useRef(artworkPlacement);
   const [videoCrop, setVideoCrop] = useState<VideoCropSettings>(() => normalizeVideoCrop(project.videoCrop));
   const videoCropRef = useRef(videoCrop);
-  const [outputSettings, setOutputSettings] = useState<VideoOutputSettings>(() => ({ ...DEFAULT_VIDEO_OUTPUT_SETTINGS, ...project.outputSettings }));
+  const [outputSettings, setOutputSettings] = useState<VideoOutputSettings>(() => normalizeVideoOutputSettings(project.outputSettings));
+  const outputSettingsRef = useRef(outputSettings);
   const DEFAULT_LAYOUT = useMemo(() => createCompositionLayout(outputSettings.width, outputSettings.height), [outputSettings.width, outputSettings.height]);
   const artworkPlacementPreviewRef = useRef<HTMLCanvasElement>(null);
   const performerVideoPreviewRef = useRef<HTMLCanvasElement>(null);
@@ -112,6 +118,7 @@ export function App() {
   const performerVideoPanelRef = useRef<HTMLDivElement | null>(null);
   const importPerformerVideoRef = useRef<() => void>(() => undefined);
   const removePerformerVideoRef = useRef<() => void>(() => undefined);
+  const exportVideoRef = useRef<() => void>(() => undefined);
   const hasElectronApi = typeof window !== "undefined" && !!(window as any).pianoPuzzle?.chooseAsset;
 
   // Animation (Phase 6)
@@ -153,6 +160,9 @@ export function App() {
   const [debugFrames, setDebugFrames] = useState<PieceAnimationFrame[]>([]);
   const [fxStats, setFxStats] = useState<ReturnType<VisualFxEngine["getStats"]>>();
   const [showHelp, setShowHelp] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportStatus, setExportStatus] = useState("");
 
   const [audioEnabled, setAudioEnabled] = useState(true);
   const audioEnabledRef = useRef(true);
@@ -166,7 +176,7 @@ export function App() {
   const fxSettingsRef = useRef(fxSettings);
   const customPresetsRef = useRef(customPresets);
 
-  useEffect(() => { referenceFrameRef.current = referenceFrame; calibrationRef.current = calibration; geometryRef.current = geometry; mappingRef.current = mapping; timingRef.current = timingSettings; expressionRef.current = expressionSettings; showPieceBordersRef.current = showPieceBorders; audioEnabledRef.current = audioEnabled; calibZoomRef.current = calibZoom; pianoPlacementRef.current = pianoPlacement; artworkPlacementRef.current = artworkPlacement; videoCropRef.current = videoCrop; fxSettingsRef.current = fxSettings; customPresetsRef.current = customPresets; }, [referenceFrame, calibration, geometry, mapping, timingSettings, expressionSettings, showPieceBorders, audioEnabled, calibZoom, pianoPlacement, artworkPlacement, videoCrop, fxSettings, customPresets]);
+  useEffect(() => { referenceFrameRef.current = referenceFrame; calibrationRef.current = calibration; geometryRef.current = geometry; mappingRef.current = mapping; timingRef.current = timingSettings; expressionRef.current = expressionSettings; showPieceBordersRef.current = showPieceBorders; audioEnabledRef.current = audioEnabled; calibZoomRef.current = calibZoom; pianoPlacementRef.current = pianoPlacement; artworkPlacementRef.current = artworkPlacement; videoCropRef.current = videoCrop; outputSettingsRef.current = outputSettings; fxSettingsRef.current = fxSettings; customPresetsRef.current = customPresets; }, [referenceFrame, calibration, geometry, mapping, timingSettings, expressionSettings, showPieceBorders, audioEnabled, calibZoom, pianoPlacement, artworkPlacement, videoCrop, outputSettings, fxSettings, customPresets]);
   useEffect(() => { setArtworkPlacement(DEFAULT_ARTWORK_PLACEMENT); }, [puzzleArtwork?.id]);
   // MIDI Recorder setup
   useEffect(() => {
@@ -1492,6 +1502,119 @@ export function App() {
   function updateChordSettings(patch: Partial<ExpressionSettings["chord"]>) { setExpressionSettings((prev) => ({ ...prev, chord: { ...prev.chord, ...patch } })); }
   const animationReady = Boolean(mapping && geometry && calibration && valid && timelineInfo.count > 0);
 
+  function applyOutputProfile(profileId: VideoOutputSettings["profileId"]) {
+    const profile = VIDEO_OUTPUT_PROFILES.find((candidate) => candidate.id === profileId);
+    if (!profile) {
+      setOutputSettings((current) => normalizeVideoOutputSettings({ ...current, profileId: "custom", quality: "custom" }));
+      return;
+    }
+    setOutputSettings((current) => normalizeVideoOutputSettings({
+      ...current,
+      profileId,
+      width: profile.width,
+      height: profile.height,
+      fps: profile.fps,
+      quality: "balanced",
+      bitrateMbps: profile.bitrateMbps
+    }));
+  }
+
+  function updateOutputDimensions(patch: Partial<Pick<VideoOutputSettings, "width" | "height">>) {
+    setOutputSettings((current) => normalizeVideoOutputSettings({ ...current, ...patch, profileId: "custom", quality: "custom" }));
+  }
+
+  function updateOutputQuality(quality: VideoOutputSettings["quality"]) {
+    setOutputSettings((current) => normalizeVideoOutputSettings({
+      ...current,
+      quality,
+      bitrateMbps: quality === "custom" ? current.bitrateMbps : bitrateForQuality(current.profileId, quality, current.fps)
+    }));
+  }
+
+  function updateOutputFps(fps: 30 | 60) {
+    setOutputSettings((current) => normalizeVideoOutputSettings({
+      ...current,
+      fps,
+      bitrateMbps: current.quality === "custom" ? current.bitrateMbps : bitrateForQuality(current.profileId, current.quality, fps)
+    }));
+  }
+
+  async function exportVideo() {
+    if (exporting) return;
+    const app = puzzlePixi.current;
+    const hostElement = puzzleHost.current;
+    const settings = outputSettingsRef.current;
+    if (!animationReady || !app || !hostElement || !app.renderer) {
+      setExportStatus("برای خروجی گرفتن، ابتدا قطعات، MIDI، کالیبراسیون و نگاشت را کامل کنید.");
+      return;
+    }
+    if (!timelineInfo.totalDurationMs) {
+      setExportStatus("مدت انیمیشن برای خروجی گرفتن صفر است.");
+      return;
+    }
+
+    const previousWidth = app.screen.width;
+    const previousHeight = app.screen.height;
+    const previousTab = previewTab;
+    setExporting(true);
+    setExportProgress(0);
+    setExportStatus("در حال آماده‌سازی بوم خروجی...");
+    setPreviewTab("puzzle");
+
+    try {
+      await nextAnimationFrame();
+      await nextAnimationFrame();
+      app.renderer.resize(settings.width, settings.height);
+      applyPuzzleTransform();
+      await nextAnimationFrame();
+      resetPlayback();
+      await nextAnimationFrame();
+
+      const audioStream = audioRef.current.getCaptureStream();
+      const result = await recordCanvasVideo({
+        canvas: app.canvas,
+        durationMs: timelineInfo.totalDurationMs,
+        fps: settings.fps,
+        videoBitsPerSecond: settings.bitrateMbps * 1_000_000,
+        preferredFormat: settings.format,
+        audioStream,
+        onStart: () => {
+          audioRef.current.resume();
+          clockRef.current.play();
+          fxRef.current?.onResume();
+          void performerVideoRef.current?.play().catch(() => undefined);
+        },
+        onProgress: (progress) => {
+          setExportProgress(progress);
+          setExportStatus(`در حال ضبط خروجی... ${Math.round(progress * 100)}٪`);
+        },
+        onStop: () => {
+          stopPlayback();
+        }
+      });
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const fileName = `piano-puzzle-${settings.width}x${settings.height}-${stamp}.${result.extension}`;
+      downloadVideoBlob(result.blob, fileName);
+      setExportProgress(1);
+      setExportStatus(result.extension === "webm" && settings.format === "mp4"
+        ? "MP4 روی این سیستم پشتیبانی نشد؛ خروجی WebM با کیفیت انتخاب‌شده ذخیره شد."
+        : `خروجی آماده شد: ${fileName}`);
+    } catch (caught) {
+      setExportStatus(caught instanceof Error ? caught.message : "خروجی گرفتن ویدئو ناموفق بود.");
+    } finally {
+      stopPlayback();
+      app.renderer.resize(previousWidth, previousHeight);
+      applyPuzzleTransform();
+      setPreviewTab(previousTab);
+      setExporting(false);
+    }
+  }
+
+  useEffect(() => {
+    exportVideoRef.current = () => void exportVideo();
+  }, [exporting, animationReady, previewTab, timelineInfo.totalDurationMs]);
+
   function assetCard(label: string, hint: string, asset: Asset | undefined, thumbUrl: string | undefined, onImport: () => void, onDrop: ((e: React.DragEvent<HTMLDivElement>) => void) | undefined, onRemove: () => void, errorText: string) {
     return <div className={`asset-card ${asset ? "asset-card-loaded" : ""}`} onDragOver={onDrop ? (e) => e.preventDefault() : undefined} onDrop={onDrop}>
       <div className="asset-card-status">{asset ? "✓ بارگذاری شد" : "— بارگذاری نشده"}</div>
@@ -1669,6 +1792,107 @@ export function App() {
     });
     drawVideoCropPreview();
   }, [performerVideo, performerVideoStatus, performerVideoError, videoCrop]);
+
+  useEffect(() => {
+    const sidebar = document.querySelector<HTMLElement>(".sidebar");
+    if (!sidebar) return;
+    const panel = document.createElement("div");
+    panel.className = "asset-card output-settings-panel";
+    panel.dataset.outputSettingsPanel = "true";
+    const profileOptions = VIDEO_OUTPUT_PROFILES.map((profile) => `<option value="${profile.id}">${profile.label}</option>`).join("");
+    panel.innerHTML = `
+      <div class="asset-card-status">⚙ تنظیمات خروجی ویدئو</div>
+      <strong>Video Export (خروجی ویدئو)</strong>
+      <small data-output-description></small>
+      <label class="output-field">Platform / مقصد<select data-output="profile">${profileOptions}<option value="custom">Custom / سفارشی</option></select></label>
+      <div class="control-row output-size-row">
+        <label>Width / عرض<input data-output="width" type="number" min="320" max="3840" step="1"></label>
+        <label>Height / ارتفاع<input data-output="height" type="number" min="320" max="3840" step="1"></label>
+      </div>
+      <div class="control-row">
+        <label>FPS<select data-output="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label>
+        <label>Fit<select data-output="fit"><option value="contain">Contain / کامل</option><option value="cover">Cover / پر</option></select></label>
+      </div>
+      <label class="output-field">Quality / کیفیت<select data-output="quality"><option value="compact">Compact / کم‌حجم</option><option value="balanced">Balanced / متعادل</option><option value="high">High / خیلی خوب</option><option value="custom">Custom / دستی</option></select></label>
+      <label class="range-label">Bitrate / نرخ فشرده‌سازی <output data-output-value="bitrate"></output></label>
+      <input data-output="bitrate" type="range" min="2" max="40" step="0.5">
+      <label class="output-field">Format / فرمت<select data-output="format"><option value="webm">WebM (پیشنهاد‌شده)</option><option value="mp4">MP4 (در صورت پشتیبانی)</option></select></label>
+      <button class="primary-button mapping-button" type="button" data-output-action="export">Export Video (خروجی گرفتن)</button>
+      <div class="export-progress" data-output-progress hidden><span></span></div>
+      <small class="anchor-hint" data-output-status>برای خروجی گرفتن، ابتدا نگاشت را کامل کنید.</small>`;
+
+    const onChange = (event: Event) => {
+      const control = event.target as HTMLInputElement | HTMLSelectElement;
+      const key = control.dataset.output;
+      if (key === "profile") applyOutputProfile(control.value as VideoOutputSettings["profileId"]);
+      if (key === "fps") updateOutputFps(Number(control.value) === 60 ? 60 : 30);
+      if (key === "quality") updateOutputQuality(control.value as VideoOutputSettings["quality"]);
+      if (key === "format") setOutputSettings((current) => ({ ...current, format: control.value === "mp4" ? "mp4" : "webm" }));
+      if (key === "fit") setOutputSettings((current) => ({ ...current, fit: control.value === "cover" ? "cover" : "contain" }));
+    };
+    const onInput = (event: Event) => {
+      const control = event.target as HTMLInputElement;
+      const key = control.dataset.output;
+      if (key === "width") updateOutputDimensions({ width: Number(control.value) });
+      if (key === "height") updateOutputDimensions({ height: Number(control.value) });
+      if (key === "bitrate") setOutputSettings((current) => normalizeVideoOutputSettings({ ...current, bitrateMbps: Number(control.value), quality: "custom" }));
+    };
+    const exportButton = panel.querySelector<HTMLButtonElement>('[data-output-action="export"]');
+    const onExport = () => exportVideoRef.current();
+    exportButton?.addEventListener("click", onExport);
+    panel.addEventListener("change", onChange);
+    panel.addEventListener("input", onInput);
+    sidebar.appendChild(panel);
+
+    return () => {
+      exportButton?.removeEventListener("click", onExport);
+      panel.removeEventListener("change", onChange);
+      panel.removeEventListener("input", onInput);
+      panel.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const panel = document.querySelector<HTMLElement>("[data-output-settings-panel]");
+    if (!panel) return;
+    const profile = panel.querySelector<HTMLSelectElement>('[data-output="profile"]');
+    const width = panel.querySelector<HTMLInputElement>('[data-output="width"]');
+    const height = panel.querySelector<HTMLInputElement>('[data-output="height"]');
+    const fps = panel.querySelector<HTMLSelectElement>('[data-output="fps"]');
+    const fit = panel.querySelector<HTMLSelectElement>('[data-output="fit"]');
+    const quality = panel.querySelector<HTMLSelectElement>('[data-output="quality"]');
+    const bitrate = panel.querySelector<HTMLInputElement>('[data-output="bitrate"]');
+    const format = panel.querySelector<HTMLSelectElement>('[data-output="format"]');
+    const description = panel.querySelector<HTMLElement>("[data-output-description]");
+    const status = panel.querySelector<HTMLElement>("[data-output-status]");
+    const progress = panel.querySelector<HTMLElement>("[data-output-progress]");
+    const progressBar = progress?.querySelector<HTMLElement>("span");
+    const exportButton = panel.querySelector<HTMLButtonElement>('[data-output-action="export"]');
+    const currentProfile = VIDEO_OUTPUT_PROFILES.find((candidate) => candidate.id === outputSettings.profileId);
+    if (profile) profile.value = outputSettings.profileId;
+    if (width) width.value = String(outputSettings.width);
+    if (height) height.value = String(outputSettings.height);
+    if (fps) fps.value = String(outputSettings.fps);
+    if (fit) fit.value = outputSettings.fit;
+    if (quality) quality.value = outputSettings.quality;
+    if (bitrate) bitrate.value = String(outputSettings.bitrateMbps);
+    if (format) format.value = outputSettings.format;
+    if (description) description.textContent = `${currentProfile?.description ?? "اندازه‌ی سفارشی"} · ${outputSettings.width}×${outputSettings.height} · نسبت ${ (outputSettings.width / outputSettings.height).toFixed(2) }`;
+    const bitrateOutput = panel.querySelector<HTMLOutputElement>('[data-output-value="bitrate"]');
+    if (bitrateOutput) bitrateOutput.textContent = `${outputSettings.bitrateMbps.toFixed(1)} Mbps`;
+    if (status && exportStatus) status.textContent = exportStatus;
+    if (progress) progress.hidden = !exporting;
+    if (progressBar) progressBar.style.width = `${Math.round(exportProgress * 100)}%`;
+    if (exportButton) {
+      exportButton.disabled = exporting || !animationReady;
+      exportButton.textContent = exporting ? `در حال خروجی گرفتن... ${Math.round(exportProgress * 100)}٪` : "Export Video (خروجی گرفتن)";
+    }
+  }, [outputSettings, exporting, exportProgress, exportStatus, animationReady]);
+
+  useEffect(() => {
+    const label = document.querySelector<HTMLElement>(".viewfinder-label");
+    if (label) label.textContent = `OUTPUT ${outputSettings.width}×${outputSettings.height}`;
+  }, [outputSettings.width, outputSettings.height]);
 
   const workflowSteps = [
     { label: "۱. تصویر مرجع پیانو (Reference Frame)", done: hasReferenceFrame },

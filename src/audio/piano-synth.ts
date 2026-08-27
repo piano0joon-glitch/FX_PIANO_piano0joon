@@ -1,15 +1,23 @@
 export class PianoSynth {
   private ctx: AudioContext | undefined;
   private master: GainNode | undefined;
+  private captureDestination: MediaStreamAudioDestinationNode | undefined;
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
       this.ctx = new AudioContext();
+      this.captureDestination = this.ctx.createMediaStreamDestination();
       this.master = this.ctx.createGain();
       this.master.gain.value = 0.3;
-      this.master.connect(this.ctx.destination);
+      this.connectMaster();
     }
     return this.ctx;
+  }
+
+  private connectMaster() {
+    if (!this.master || !this.ctx) return;
+    this.master.connect(this.ctx.destination);
+    if (this.captureDestination) this.master.connect(this.captureDestination);
   }
 
   resume() {
@@ -56,6 +64,11 @@ export class PianoSynth {
     this.master.disconnect();
     this.master = this.ctx.createGain();
     this.master.gain.value = 0.3;
-    this.master.connect(this.ctx.destination);
+    this.connectMaster();
+  }
+
+  getCaptureStream(): MediaStream | undefined {
+    this.ensureContext();
+    return this.captureDestination?.stream;
   }
 }
