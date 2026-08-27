@@ -17,6 +17,8 @@ export interface KeyGlowAnchor {
   midiNote: number;
   topPoint: Point;
   width: number;
+  leftPoint?: Point;
+  rightPoint?: Point;
 }
 
 interface ActiveKeyGlow {
@@ -448,11 +450,26 @@ export class KeyboardGlowController {
     this.fogWisps = [];
     this.sparkles = [];
     this.activeGlows.clear();
+    this.hideAllVisuals();
 
     this.keyAnchors = anchors.slice().sort((a, b) => a.topPoint.x - b.topPoint.x);
     this.keyAnchorByMidi.clear();
     for (const anchor of this.keyAnchors) this.keyAnchorByMidi.set(anchor.midiNote, anchor);
     this.renderBar(1.0, this.isEnabled);
+  }
+
+  private hideAllVisuals(): void {
+    this.hazeSprite.visible = false;
+    this.glowSprite.visible = false;
+    this.bandSprite.visible = false;
+    this.coreSprite.visible = false;
+    this.shimmerA.visible = false;
+    this.shimmerB.visible = false;
+    for (const s of this.wispPool) s.visible = false;
+    for (const s of this.beamPool) s.visible = false;
+    for (const s of this.flarePool) s.visible = false;
+    for (const s of this.sparklePool) s.visible = false;
+    this.gpuStyle.clear();
   }
 
   applySettings(
@@ -552,19 +569,15 @@ export class KeyboardGlowController {
 
   private renderBar(globalIntensity: number, enabled: boolean): void {
     if (!enabled || !this.isEnabled || this.keyAnchors.length < 2) {
-      this.hazeSprite.visible = false;
-      this.glowSprite.visible = false;
-      this.bandSprite.visible = false;
-      this.coreSprite.visible = false;
-      this.shimmerA.visible = false;
-      this.shimmerB.visible = false;
-      this.gpuStyle.clear();
+      this.hideAllVisuals();
       return;
     }
 
     const t = this.time;
-    const firstP = this.keyAnchors[0].topPoint;
-    const lastP = this.keyAnchors[this.keyAnchors.length - 1].topPoint;
+    const firstAnchor = this.keyAnchors[0];
+    const lastAnchor = this.keyAnchors[this.keyAnchors.length - 1];
+    const firstP = firstAnchor.leftPoint ?? firstAnchor.topPoint;
+    const lastP = lastAnchor.rightPoint ?? lastAnchor.topPoint;
     const dx = lastP.x - firstP.x;
     const dy = lastP.y - firstP.y;
     const lineLen = Math.max(10, Math.hypot(dx, dy));
@@ -642,11 +655,7 @@ export class KeyboardGlowController {
       this.activeGlows.clear();
       this.fogWisps.length = 0;
       this.sparkles.length = 0;
-      for (const s of this.wispPool) s.visible = false;
-      for (const s of this.beamPool) s.visible = false;
-      for (const s of this.flarePool) s.visible = false;
-      for (const s of this.sparklePool) s.visible = false;
-      this.gpuStyle.clear();
+      this.hideAllVisuals();
       return;
     }
     if (!this.paused) {
@@ -777,17 +786,7 @@ export class KeyboardGlowController {
     this.activeGlows.clear();
     this.fogWisps = [];
     this.sparkles = [];
-    for (const s of this.wispPool) s.visible = false;
-    for (const s of this.beamPool) s.visible = false;
-    for (const s of this.flarePool) s.visible = false;
-    for (const s of this.sparklePool) s.visible = false;
-    this.hazeSprite.visible = false;
-    this.glowSprite.visible = false;
-    this.bandSprite.visible = false;
-    this.coreSprite.visible = false;
-    this.shimmerA.visible = false;
-    this.shimmerB.visible = false;
-    this.gpuStyle.clear();
+    this.hideAllVisuals();
   }
 
   dispose(): void {

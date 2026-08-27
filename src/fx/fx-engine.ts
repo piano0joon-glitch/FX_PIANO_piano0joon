@@ -145,6 +145,7 @@ export class VisualFxEngine {
     this.config = normalizeVisualFxConfig({ ...this.config, ...config });
     this.layer.visible = this.config.enabled;
     this.lightTrail.configure(this.config.lightTrailLifetimeMs, this.config.trailFadeSpeed);
+    this.syncKeyboardGlowSettings();
     if (!this.config.enabled) this.clearTransient();
     // Only restart demo if the preset changed — other config changes
     // (like pathCurvature, particleDensity, etc.) are read live each frame
@@ -516,18 +517,8 @@ export class VisualFxEngine {
     }
     // Lighting disabled for performance
 
-    this.keyboardGlow.setPaused(this.paused);
+    this.syncKeyboardGlowSettings();
     const keyboardGlowEnabled = this.config.keyboardGlowEnabled && this.config.enabled;
-    this.keyboardGlow.applySettings(
-      this.config.keyboardGlowThickness,
-      this.config.keyboardGlowSpread,
-      this.config.keyboardGlowSoftness,
-      this.config.keyboardGlowDissolveSpeed,
-      this.config.keyboardGlowPulseAmount,
-      1.0,
-      keyboardGlowEnabled,
-      this.config.keyboardGlowStyle
-    );
     this.keyboardGlow.update(deltaSeconds, keyboardGlowEnabled, 1.0);
     if (this.glowController.activeCount > 0) this.glowController.update(deltaMs);
     if (this.impactEffect.activeCount > 0) this.impactEffect.update(deltaMs);
@@ -619,6 +610,21 @@ export class VisualFxEngine {
   }
 
   getKeyboardGlow() { return this.keyboardGlow; }
+
+  private syncKeyboardGlowSettings(): void {
+    const keyboardGlowEnabled = this.config.keyboardGlowEnabled && this.config.enabled;
+    this.keyboardGlow.setPaused(this.paused);
+    this.keyboardGlow.applySettings(
+      this.config.keyboardGlowThickness,
+      this.config.keyboardGlowSpread,
+      this.config.keyboardGlowSoftness,
+      this.config.keyboardGlowDissolveSpeed,
+      this.config.keyboardGlowPulseAmount,
+      1.0,
+      keyboardGlowEnabled,
+      this.config.keyboardGlowStyle
+    );
+  }
 
   setKeyboardGlowAnchors(anchors: { midiNote: number; topPoint: { x: number; y: number }; width: number }[]): void {
     this.keyboardGlow.setKeyAnchors(anchors);

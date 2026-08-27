@@ -10,7 +10,7 @@ import { createOverlaySvg } from "../../keyboard/overlay-generator";
 import { loadCalibrations, saveCalibrationWithTimestamp } from "../../keyboard/calibration-store";
 import { calibrationIsValid, createDefaultCalibration, migrateCalibration, updateAnchorDiagnostics, viewTransform } from "../../keyboard/calibration-workflow";
 import { isValidQuadrilateral } from "../../keyboard/homography";
-import { anchorReferencePoint, baseProject, computeCornerHomography, buildKeyProjectionContext, projectKeyTopEdge } from "../../keyboard/key-projection";
+import { anchorReferencePoint, baseProject, computeCornerHomography, buildKeyProjectionContext, projectKeyTopEdge, projectKeyTopSegment } from "../../keyboard/key-projection";
 import { computeViewProjection, toSourcePoint, toViewPoint } from "../../keyboard/view-projection";
 import { parseMidi } from "../../midi/parser";
 import { mapMidiToPuzzle } from "../../midi/note-mapper";
@@ -33,7 +33,7 @@ import type { ArtworkPlacementConfig, PianoPlacementConfig, PlacementAlignX, Pla
 import { createCompositionLayout, normalizeCompositionLayout } from "../../composition/composition-store";
 import { PianoSynth } from "../../audio/piano-synth";
 import { VisualFxEngine } from "../../fx/fx-engine";
-import { DEFAULT_VISUAL_FX_CONFIG, type FxAnimationFrame, type VisualFxConfig } from "../../fx/fx-types";
+import { DEFAULT_VISUAL_FX_CONFIG, normalizeVisualFxConfig, type FxAnimationFrame, type VisualFxConfig } from "../../fx/fx-types";
 import { bitrateForQuality, DEFAULT_VIDEO_CROP, DEFAULT_VIDEO_OUTPUT_SETTINGS, normalizeVideoCrop, normalizeVideoOutputSettings, VIDEO_OUTPUT_PROFILES, type VideoCropSettings, type VideoOutputSettings } from "../../video/models";
 import { downloadVideoBlob, recordCanvasVideo } from "../../video/video-exporter";
 
@@ -194,18 +194,6 @@ export function App() {
   useEffect(() => {
     if (fxRef.current) {
       fxRef.current.setConfig(fxSettings);
-      const kGlow = fxRef.current.getKeyboardGlow();
-      kGlow.applySettings(
-        fxSettings.keyboardGlowThickness,
-        fxSettings.keyboardGlowSpread,
-        fxSettings.keyboardGlowSoftness,
-        fxSettings.keyboardGlowDissolveSpeed,
-        fxSettings.keyboardGlowPulseAmount,
-        1.0,
-        fxSettings.keyboardGlowEnabled && fxSettings.enabled,
-        fxSettings.keyboardGlowStyle
-      );
-      kGlow.update(0.016, fxSettings.keyboardGlowEnabled && fxSettings.enabled, 1.0);
     }
   }, [fxSettings]);
   // Load custom presets from localStorage
@@ -397,11 +385,25 @@ export function App() {
       const key = control.dataset.fx as keyof VisualFxConfig | undefined;
       if (!key) return;
       const value = control instanceof HTMLInputElement && control.type === "checkbox" ? control.checked : control.value;
-      setFxSettings((current) => ({ ...current, [key]: typeof current[key] === "number" ? Number(value) : value } as VisualFxConfig));
+      const current = fxSettingsRef.current;
+      const next = normalizeVisualFxConfig({
+        ...current,
+        [key]: typeof current[key] === "number" ? Number(value) : value
+      } as Partial<VisualFxConfig>);
+      // Apply immediately so the visual line responds while the slider is
+      // moving, even before React schedules the next render.
+      fxSettingsRef.current = next;
+      setFxSettings(next);
+      fxRef.current?.setConfig(next);
     };
     const onPanelClick = (event: Event) => {
       const action = (event.target as HTMLElement).dataset.fxAction;
-      if (action === "reset") setFxSettings(DEFAULT_VISUAL_FX_CONFIG);
+      if (action === "reset") {
+        const next = normalizeVisualFxConfig(DEFAULT_VISUAL_FX_CONFIG);
+        fxSettingsRef.current = next;
+        setFxSettings(next);
+        fxRef.current?.setConfig(next);
+      }
       if (action === "save-preset") {
         const nameInput = document.getElementById("custom-preset-name") as HTMLInputElement | null;
         const name = nameInput?.value?.trim();
@@ -428,7 +430,10 @@ export function App() {
         const sel = document.getElementById("custom-preset-select") as HTMLSelectElement | null;
         const name = sel?.value;
         if (!name || !customPresetsRef.current[name]) { alert("یک پریست انتخاب کنید"); return; }
-        setFxSettings((prev) => ({ ...prev, ...customPresetsRef.current[name] } as VisualFxConfig));
+        const next = normalizeVisualFxConfig({ ...fxSettingsRef.current, ...customPresetsRef.current[name] });
+        fxSettingsRef.current = next;
+        setFxSettings(next);
+        fxRef.current?.setConfig(next);
       }
       if (action === "delete-preset") {
         const sel = document.getElementById("custom-preset-select") as HTMLSelectElement | null;
@@ -818,14 +823,16 @@ export function App() {
     const whiteKeys = calibrationValue.keyMap.filter((key) => key.keyType === "white");
     const anchors = whiteKeys.map((key) => {
       const sourcePoint = projectKeyTopEdge(calibrationValue, key, keyContext);
+      const sourceSegment = projectKeyTopSegment(calibrationValue, key, keyContext);
       const topPoint = projectCompPoint(sourcePoint, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
+      const leftPoint = projectCompPoint(sourceSegment.left, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
+      const rightPoint = projectCompPoint(sourceSegment.right, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
       return {
         midiNote: key.midiNote,
         topPoint,
-        width: Math.max(
-          4,
-          key.normalizedWidth * DEFAULT_LAYOUT.pianoRegion.width * keyPlacement.scale * 0.5
-        )
+        leftPoint,
+        rightPoint,
+        width: Math.max(4, Math.hypot(rightPoint.x - leftPoint.x, rightPoint.y - leftPoint.y))
       };
     });
     fx.setKeyboardGlowAnchors(anchors);
@@ -1064,7 +1071,7 @@ export function App() {
       const pianoBackground = new Container(); pianoBackgroundRef.current = pianoBackground; app.stage.addChild(pianoBackground);
       const renderer = new PuzzleRenderer(); rendererRef.current = renderer; app.stage.addChild(renderer.layer);
       const debugLayer = new Container(); debugLayer.visible = timingRef.current.debugVisible; debugLayerRef.current = debugLayer; app.stage.addChild(debugLayer);
-      const fx = new VisualFxEngine(); fx.initialize(app.stage, fxSettings); fxRef.current = fx;
+      const fx = new VisualFxEngine(); fx.initialize(app.stage, fxSettingsRef.current); fxRef.current = fx;
       app.renderer.on("resize", onResize);
       app.ticker.add(tick);
       applyPuzzleTransform();

@@ -142,9 +142,30 @@ export function projectKeyCenter(calibration: Calibration, key: PianoKey, ctx: K
  * horizontal line visibly float away from the keyboard.
  */
 export function projectKeyTopEdge(calibration: Calibration, key: PianoKey, ctx: KeyProjectionContext): Point {
-  const base = projectPoint(calibration, key.topEdge, ctx.corrections);
+  const segment = projectKeyTopSegment(calibration, key, ctx);
+  return {
+    x: (segment.left.x + segment.right.x) / 2,
+    y: (segment.left.y + segment.right.y) / 2
+  };
+}
+
+export function projectKeyTopSegment(
+  calibration: Calibration,
+  key: PianoKey,
+  ctx: KeyProjectionContext
+): { left: Point; right: Point } {
+  const left = projectPoint(calibration, { x: key.normalizedX, y: key.normalizedY }, ctx.corrections);
+  const right = projectPoint(
+    calibration,
+    { x: key.normalizedX + key.normalizedWidth, y: key.normalizedY },
+    ctx.corrections
+  );
   const bounds = ctx.manualBoundsX.get(key.midiNote);
-  return bounds ? { x: (bounds.left + bounds.right) / 2, y: base.y } : base;
+  if (!bounds) return { left, right };
+  return {
+    left: { x: bounds.left, y: left.y },
+    right: { x: bounds.right, y: right.y }
+  };
 }
 
 export function projectKeySpawn(calibration: Calibration, key: PianoKey, ctx: KeyProjectionContext): Point {
