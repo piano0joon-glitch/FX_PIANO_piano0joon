@@ -1,4 +1,15 @@
-import { Container, Graphics, Sprite, Texture } from "pixi.js";
+import {
+  Buffer,
+  BufferUsage,
+  Container,
+  Geometry,
+  GlProgram,
+  Mesh,
+  Shader,
+  Sprite,
+  Texture,
+  UniformGroup
+} from "pixi.js";
 import { clamp } from "./fx-types";
 import type { Point } from "../geometry/models";
 
@@ -37,6 +48,228 @@ interface SparkleDot {
   maxLife: number;
   size: number;
   tint: number;
+}
+
+type GlowStyleUniformStructure = {
+  uTime: { value: number; type: "f32" };
+  uStyle: { value: number; type: "f32" };
+  uIntensity: { value: number; type: "f32" };
+  uThickness: { value: number; type: "f32" };
+  uColor: { value: [number, number, number, number]; type: "vec4<f32>" };
+};
+
+const GLOW_STYLE_VERTEX = `
+in vec2 aPosition;
+in vec2 aUV;
+
+out vec2 vUV;
+
+void main(void)
+{
+    gl_Position = vec4((uProjectionMatrix * uWorldTransformMatrix * vec3(aPosition, 1.0)).xy, 0.0, 1.0);
+    vUV = aUV;
+}
+`;
+
+const GLOW_STYLE_FRAGMENT = `
+in vec2 vUV;
+
+uniform float uTime;
+uniform float uStyle;
+uniform float uIntensity;
+uniform float uThickness;
+uniform vec4 uColor;
+
+float hash21(vec2 p)
+{
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+void main(void)
+{
+    float x = clamp(vUV.x, 0.0, 1.0);
+    float v = clamp(vUV.y, 0.0, 1.0);
+    float edgeFade = smoothstep(0.0, 0.055, x) * (1.0 - smoothstep(0.945, 1.0, x));
+    float lineDistance = abs(v - 0.5);
+    float lineWidth = max(0.012, uThickness);
+    float alpha = 0.0;
+    vec3 color = uColor.rgb;
+
+    if (uStyle < 1.5) {
+        // Wave: two smooth GPU-generated strands and a soft underwater halo.
+        float waveA = sin(x * 14.0 + uTime * 3.2) * 0.055
+            + sin(x * 31.0 - uTime * 4.6) * 0.018;
+        float waveB = sin(x * 9.0 - uTime * 1.9 + 1.7) * 0.085
+            + sin(x * 23.0 + uTime * 2.4) * 0.022;
+        float strandA = 1.0 - smoothstep(lineWidth * 0.5, lineWidth * 1.8, abs(v - (0.5 + waveA)));
+        float strandB = 1.0 - smoothstep(lineWidth * 0.9, lineWidth * 3.2, abs(v - (0.5 + waveB)));
+        float halo = 1.0 - smoothstep(0.08, 0.28, lineDistance);
+        alpha = (strandA * 0.72 + strandB * 0.26 + halo * 0.12) * 0.72;
+        color = mix(uColor.rgb, vec3(0.80, 0.92, 1.0), 0.48);
+    } else if (uStyle < 2.5) {
+        // Fire: deterministic flickering flame field rising above the line.
+        float rise = max(0.0, 0.5 - v);
+        float flicker = 0.5 + 0.5 * sin(x * 57.0 + uTime * 8.5)
+            + 0.22 * sin(x * 131.0 - uTime * 12.0);
+        float flameHeight = 0.15 + 0.28 * clamp(flicker, 0.0, 1.0);
+        float flame = 1.0 - smoothstep(flameHeight * 0.66, flameHeight, rise);
+        float base = 1.0 - smoothstep(lineWidth * 0.7, lineWidth * 3.0, lineDistance);
+        float emberBand = 1.0 - smoothstep(0.012, 0.04, abs(fract(x * 23.0 + uTime * 0.8) - 0.5));
+        alpha = (flame * 0.82 + base * 0.35 + emberBand * rise * 0.25) * 0.78;
+        color = mix(vec3(1.0, 0.18, 0.015), vec3(1.0, 0.86, 0.22), clamp(rise / max(0.001, flameHeight), 0.0, 1.0));
+    } else {
+        // Particles: moving deterministic dots, fully evaluated in the fragment shader.
+        vec2 cell = floor(vec2(x * 34.0, v * 18.0));
+        float seed = hash21(cell);
+        vec2 local = fract(vec2(x * 34.0, v * 18.0)) - 0.5;
+        local.y += sin(uTime * (0.7 + seed * 1.8) + seed * 6.283) * 0.22;
+        float dot = 1.0 - smoothstep(0.06 + seed * 0.035, 0.005, length(local));
+        float pulse = 0.35 + 0.65 * sin(uTime * (2.0 + seed * 3.0) + seed * 9.0) * 0.5 + 0.35;
+        float base = 1.0 - smoothstep(0.02, 0.14, lineDistance);
+        alpha = (dot * pulse * 0.8 + base * 0.16) * 0.72;
+        color = mix(vec3(0.42, 0.76, 1.0), vec3(0.92, 0.98, 1.0), seed);
+    }
+
+    float visible = clamp(alpha * edgeFade * uIntensity, 0.0, 1.0);
+    finalColor = vec4(color * visible, visible) * uWorldColorAlpha;
+}
+`;
+
+/**
+ * GPU procedural renderer for the non-default keyboard glow styles.
+ *
+ * It keeps one quad alive and changes only uniforms during playback. Wave,
+ * fire and particle styling therefore never rebuilds Pixi Graphics geometry
+ * on the CPU.
+ */
+class GpuGlowStyleRenderer {
+  readonly mesh: Mesh<Geometry, Shader>;
+
+  private readonly positionData = new Float32Array(8);
+  private readonly positionBuffer: Buffer;
+  private readonly uniforms: UniformGroup<GlowStyleUniformStructure>;
+  private lastFirstX = Number.NaN;
+  private lastFirstY = Number.NaN;
+  private lastLastX = Number.NaN;
+  private lastLastY = Number.NaN;
+  private lastHalfHeight = Number.NaN;
+
+  constructor() {
+    const uvData = new Float32Array([
+      0, 0,
+      1, 0,
+      1, 1,
+      0, 1
+    ]);
+    const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+    this.positionBuffer = new Buffer({
+      data: this.positionData,
+      usage: BufferUsage.VERTEX | BufferUsage.COPY_DST,
+      shrinkToFit: false
+    });
+    const geometry = new Geometry({
+      attributes: {
+        aPosition: { buffer: this.positionBuffer, format: "float32x2", stride: 2 * 4 },
+        aUV: {
+          buffer: new Buffer({
+            data: uvData,
+            usage: BufferUsage.VERTEX | BufferUsage.STATIC,
+            shrinkToFit: false
+          }),
+          format: "float32x2",
+          stride: 2 * 4
+        }
+      },
+      indexBuffer: new Buffer({
+        data: indices,
+        usage: BufferUsage.INDEX | BufferUsage.STATIC,
+        shrinkToFit: false
+      })
+    });
+
+    this.uniforms = new UniformGroup<GlowStyleUniformStructure>({
+      uTime: { value: 0, type: "f32" },
+      uStyle: { value: 0, type: "f32" },
+      uIntensity: { value: 0, type: "f32" },
+      uThickness: { value: 0.05, type: "f32" },
+      uColor: { value: [0.35, 0.78, 1.0, 1.0], type: "vec4<f32>" }
+    });
+    const shader = new Shader({
+      glProgram: GlProgram.from({
+        vertex: GLOW_STYLE_VERTEX,
+        fragment: GLOW_STYLE_FRAGMENT,
+        name: "piano-puzzle-gpu-keyboard-glow"
+      }),
+      resources: { glowStyleUniforms: this.uniforms }
+    });
+
+    this.mesh = new Mesh({ geometry, shader });
+    this.mesh.blendMode = "add";
+    this.mesh.renderable = false;
+  }
+
+  update(
+    first: Point,
+    last: Point,
+    thickness: number,
+    spread: number,
+    time: number,
+    intensity: number,
+    style: "default" | "wave" | "fire" | "particles",
+    enabled: boolean
+  ): void {
+    const styleValue = style === "wave" ? 1 : style === "fire" ? 2 : style === "particles" ? 3 : 0;
+    const halfHeight = Math.max(12, spread * 1.9 + thickness * 4);
+    if (
+      first.x !== this.lastFirstX
+      || first.y !== this.lastFirstY
+      || last.x !== this.lastLastX
+      || last.y !== this.lastLastY
+      || halfHeight !== this.lastHalfHeight
+    ) {
+      const dx = last.x - first.x;
+      const dy = last.y - first.y;
+      const length = Math.sqrt(dx * dx + dy * dy) || 1;
+      // Screen-space "up" normal: for a horizontal line this is (0, -1).
+      const normalX = dy / length;
+      const normalY = -dx / length;
+      this.positionData[0] = first.x + normalX * halfHeight;
+      this.positionData[1] = first.y + normalY * halfHeight;
+      this.positionData[2] = last.x + normalX * halfHeight;
+      this.positionData[3] = last.y + normalY * halfHeight;
+      this.positionData[4] = last.x - normalX * halfHeight;
+      this.positionData[5] = last.y - normalY * halfHeight;
+      this.positionData[6] = first.x - normalX * halfHeight;
+      this.positionData[7] = first.y - normalY * halfHeight;
+      this.positionBuffer.update();
+      this.lastFirstX = first.x;
+      this.lastFirstY = first.y;
+      this.lastLastX = last.x;
+      this.lastLastY = last.y;
+      this.lastHalfHeight = halfHeight;
+    }
+
+    this.uniforms.uniforms.uTime = time;
+    this.uniforms.uniforms.uStyle = styleValue;
+    this.uniforms.uniforms.uIntensity = styleValue === 0 || !enabled ? 0 : Math.max(0, Math.min(1, intensity));
+    this.uniforms.uniforms.uThickness = Math.max(0.012, Math.min(0.32, thickness / Math.max(1, halfHeight * 2)));
+    this.mesh.renderable = enabled && styleValue > 0 && intensity > 0.001;
+  }
+
+  clear(): void {
+    this.mesh.renderable = false;
+    this.uniforms.uniforms.uIntensity = 0;
+  }
+
+  destroy(): void {
+    const geometry = this.mesh.geometry;
+    const shader = this.mesh.shader;
+    this.mesh.destroy();
+    geometry.destroy(true);
+    shader?.destroy();
+  }
 }
 
 const GAUSS_STOPS: Array<[number, number]> = [
@@ -141,9 +374,10 @@ export class KeyboardGlowController {
 
   private readonly shimmerA: Sprite;
   private readonly shimmerB: Sprite;
-  private readonly customFx: Graphics;
+  private readonly gpuStyle: GpuGlowStyleRenderer;
 
   private keyAnchors: KeyGlowAnchor[] = [];
+  private readonly keyAnchorByMidi = new Map<number, KeyGlowAnchor>();
   private activeGlows = new Map<number, ActiveKeyGlow>();
 
   private thickness = 4;
@@ -196,8 +430,8 @@ export class KeyboardGlowController {
 
     this.shimmerA = mk(this.blobTex, 0xffffff, this.ambientLayer);
     this.shimmerB = mk(this.blobTex, 0xcfe6ff, this.ambientLayer);
-    this.customFx = new Graphics();
-    this.fxLayer.addChild(this.customFx);
+    this.gpuStyle = new GpuGlowStyleRenderer();
+    this.fxLayer.addChild(this.gpuStyle.mesh);
 
     // Hide all ambient sprites until setKeyAnchors positions them correctly
     this.hazeSprite.visible = false;
@@ -216,6 +450,8 @@ export class KeyboardGlowController {
     this.activeGlows.clear();
 
     this.keyAnchors = anchors.slice().sort((a, b) => a.topPoint.x - b.topPoint.x);
+    this.keyAnchorByMidi.clear();
+    for (const anchor of this.keyAnchors) this.keyAnchorByMidi.set(anchor.midiNote, anchor);
     this.renderBar(1.0, this.isEnabled);
   }
 
@@ -250,7 +486,7 @@ export class KeyboardGlowController {
     if (!existing || intensity > existing.intensity) {
       this.activeGlows.set(midiNote, { intensity, color, birthTime: this.time });
     }
-    const anchor = this.keyAnchors.find((a) => a.midiNote === midiNote);
+    const anchor = this.keyAnchorByMidi.get(midiNote);
     if (anchor) {
       const burst = Math.floor(2 + intensity * 4);
       for (let i = 0; i < burst; i++) {
@@ -322,181 +558,89 @@ export class KeyboardGlowController {
       this.coreSprite.visible = false;
       this.shimmerA.visible = false;
       this.shimmerB.visible = false;
+      this.gpuStyle.clear();
       return;
     }
 
     const t = this.time;
     const firstP = this.keyAnchors[0].topPoint;
     const lastP = this.keyAnchors[this.keyAnchors.length - 1].topPoint;
-    const cy = firstP.y;
-    const lineLen = Math.max(10, lastP.x - firstP.x);
+    const dx = lastP.x - firstP.x;
+    const dy = lastP.y - firstP.y;
+    const lineLen = Math.max(10, Math.hypot(dx, dy));
     const cx = (firstP.x + lastP.x) / 2;
+    const cy = (firstP.y + lastP.y) / 2;
+    const lineAngle = Math.atan2(dy, dx);
 
     const breathe = 1 - this.pulseAmount * 0.22 * (0.5 + 0.5 * Math.sin(t * 1.6));
 
     this.hazeSprite.visible = true;
     this.hazeSprite.position.set(cx, cy);
+    this.hazeSprite.rotation = lineAngle;
     this.hazeSprite.width = lineLen * 1.15;
     this.hazeSprite.height = Math.max(4, this.spread * 3.2 * breathe);
     this.hazeSprite.alpha = (0.12 + 0.22 * this.softness) * globalIntensity;
 
     this.glowSprite.visible = true;
     this.glowSprite.position.set(cx, cy);
+    this.glowSprite.rotation = lineAngle;
     this.glowSprite.width = lineLen * 1.08;
     this.glowSprite.height = Math.max(3, this.spread * 1.2 * breathe);
     this.glowSprite.alpha = (0.28 + 0.35 * this.softness) * globalIntensity;
 
     this.bandSprite.visible = true;
     this.bandSprite.position.set(cx, cy);
+    this.bandSprite.rotation = lineAngle;
     this.bandSprite.width = lineLen * 1.04;
     this.bandSprite.height = Math.max(2, this.thickness * 4.5 + 4);
     this.bandSprite.alpha = 0.65 * globalIntensity * breathe;
 
     this.coreSprite.visible = true;
     this.coreSprite.position.set(cx, cy);
+    this.coreSprite.rotation = lineAngle;
     this.coreSprite.width = lineLen * 1.01;
     this.coreSprite.height = Math.max(1.2, this.thickness * 1.5 + 1.0);
     this.coreSprite.alpha = 0.98 * globalIntensity;
 
-    // Hide default shimmers — customFx handles all style effects
+    // Hide default shimmers — the GPU style mesh handles non-default effects.
     this.shimmerA.visible = false;
     this.shimmerB.visible = false;
-    this.customFx.clear();
-
-    if (this.glowStyle === "wave") {
-      // ── WAVE: dramatic ocean waves with sharp crests ──
-      const segments = 80;
-      const baseAmp = this.thickness * 8 * breathe;
-      const speed = 1.8;
-      const buildWave = (xR: number, spd: number, aMul: number, ph: number): number => {
-        const w1 = Math.sin(xR * Math.PI * 2.2 + t * spd + ph);
-        const w2 = Math.sin(xR * Math.PI * 4.1 + t * spd * 1.3 + ph * 2) * 0.4;
-        const w3 = Math.sin(xR * Math.PI * 7.3 + t * spd * 0.7 + ph * 3) * 0.15;
-        const c = w1 + w2 + w3;
-        return c > 0 ? Math.pow(c, 0.6) * baseAmp * aMul : c * baseAmp * aMul * 0.5;
-      };
-      const segments2 = segments;
-      // Deep water swell
-      this.customFx.moveTo(firstP.x, cy);
-      for (let i = 1; i <= segments2; i++) {
-        const r = i / segments2;
-        this.customFx.lineTo(firstP.x + r * lineLen, cy + buildWave(r, speed * 0.6, 1.2, 0));
-      }
-      this.customFx.stroke({ width: this.thickness * 5, color: 0x1a3a5c, alpha: 0.2 * globalIntensity });
-      // Surface wave with sharp crests
-      this.customFx.moveTo(firstP.x, cy);
-      for (let i = 1; i <= segments2; i++) {
-        const r = i / segments2;
-        this.customFx.lineTo(firstP.x + r * lineLen, cy + buildWave(r, speed * 1.4, 0.7, 2.5));
-      }
-      this.customFx.stroke({ width: this.thickness * 2.5, color: 0x4499dd, alpha: 0.45 * globalIntensity });
-      // Foam/crest highlight
-      this.customFx.moveTo(firstP.x, cy);
-      for (let i = 1; i <= segments2; i++) {
-        const r = i / segments2;
-        this.customFx.lineTo(firstP.x + r * lineLen, cy + buildWave(r, speed * 1.4, 0.7, 2.5));
-      }
-      this.customFx.stroke({ width: this.thickness * 1.0, color: 0xccddff, alpha: 0.7 * globalIntensity });
-      // Spray at crests
-      for (let i = 0; i < 25; i++) {
-        const seed = i * 53.71;
-        const wr = (Math.sin(t * speed * 0.8 + seed) * 0.5 + 0.5);
-        const sx = firstP.x + wr * lineLen;
-        const crestY = cy + buildWave(wr, speed * 1.4, 0.7, 2.5);
-        const sprayH = baseAmp * 0.3 * Math.abs(Math.sin(seed + t * 3));
-        this.customFx.circle(sx, crestY - sprayH * (0.5 + Math.random() * 0.5), 1.5 + Math.random());
-        this.customFx.fill({ color: 0xeeeeff, alpha: (0.2 + 0.15 * Math.sin(seed + t * 4)) * globalIntensity });
-      }
-
-    } else if (this.glowStyle === "fire") {
-      // ── FIRE: flames rising from the bar ──
-      const flameCount = 40;
-      for (let i = 0; i < flameCount; i++) {
-        const ratio = (i + 0.5) / flameCount;
-        const x = firstP.x + ratio * lineLen;
-        const seed = i * 137.508;
-        // Flickering flame height
-        const flicker1 = Math.sin(t * 9 + seed) * 0.5 + 0.5;
-        const flicker2 = Math.sin(t * 13 + seed * 1.7) * 0.3 + 0.7;
-        const flameH = this.thickness * (8 + flicker1 * 18) * breathe * flicker2;
-        const sway = Math.sin(t * 4 + seed * 0.5) * 3;
-        // Outer flame (dark red)
-        this.customFx.rect(x - 2 + sway * 0.5, cy - flameH * 0.8, 5, flameH * 0.9);
-        this.customFx.fill({ color: 0xcc2200, alpha: 0.2 * globalIntensity * flicker1 });
-        // Middle flame (orange)
-        this.customFx.rect(x - 1.5 + sway * 0.3, cy - flameH * 0.6, 4, flameH * 0.7);
-        this.customFx.fill({ color: 0xff6600, alpha: 0.4 * globalIntensity * flicker2 });
-        // Inner flame (yellow)
-        this.customFx.rect(x - 1 + sway * 0.2, cy - flameH * 0.35, 3, flameH * 0.45);
-        this.customFx.fill({ color: 0xffcc00, alpha: 0.5 * globalIntensity * flicker1 });
-        // Core (white-hot)
-        this.customFx.rect(x - 0.5 + sway * 0.1, cy - flameH * 0.15, 2, flameH * 0.2);
-        this.customFx.fill({ color: 0xffffff, alpha: 0.35 * globalIntensity * flicker2 });
-      }
-      // Ember sparks rising above flames
-      for (let i = 0; i < 15; i++) {
-        const seed = i * 73.13;
-        const sparkX = firstP.x + ((Math.sin(seed + t * 0.8) * 0.5 + 0.5)) * lineLen;
-        const sparkY = cy - 30 - Math.abs(Math.sin(seed * 1.3 + t * 1.2)) * this.spread * 1.5;
-        const sparkSize = 1.5 + Math.sin(seed + t * 3) * 0.8;
-        this.customFx.circle(sparkX, sparkY, sparkSize);
-        this.customFx.fill({ color: 0xff8844, alpha: (0.3 + 0.2 * Math.sin(seed + t * 4)) * globalIntensity });
-      }
-
-    } else if (this.glowStyle === "particles") {
-      // ── PARTICLES: glowing orbs floating upward ──
-      const count = 50;
-      for (let i = 0; i < count; i++) {
-        const seed = i * 97.31;
-        const speed = 0.3 + (i % 5) * 0.15;
-        const drift = Math.sin(seed + t * speed) * lineLen * 0.5;
-        const px = firstP.x + lineLen * 0.5 + drift;
-        const riseSpeed = 0.4 + (i % 3) * 0.2;
-        const py = cy - ((t * riseSpeed * 40 + seed * 7) % (this.spread * 2.5));
-        const size = 2 + Math.sin(seed + t * 2) * 1.2;
-        const alpha = (0.15 + 0.1 * Math.sin(seed * 2 + t)) * globalIntensity;
-        // Outer glow
-        this.customFx.circle(px, py, size * 3);
-        this.customFx.fill({ color: 0x88bbff, alpha: alpha * 0.15 });
-        // Mid glow
-        this.customFx.circle(px, py, size * 1.8);
-        this.customFx.fill({ color: 0xaaddff, alpha: alpha * 0.35 });
-        // Core
-        this.customFx.circle(px, py, size * 0.6);
-        this.customFx.fill({ color: 0xffffff, alpha: alpha * 0.7 });
-      }
-      // Bright sparkles at random positions
-      for (let i = 0; i < 20; i++) {
-        const seed = i * 53.71 + 100;
-        const sx = firstP.x + ((Math.sin(seed + t * 0.4) * 0.5 + 0.5)) * lineLen;
-        const sy = cy - 10 - Math.abs(Math.cos(seed * 0.8 + t * 0.6)) * this.spread * 0.8;
-        const flash = Math.sin(seed * 3 + t * 5) > 0.7 ? 1 : 0;
-        if (flash) {
-          this.customFx.circle(sx, sy, 2.5);
-          this.customFx.fill({ color: 0xffffff, alpha: 0.6 * globalIntensity });
-        }
-      }
-
-    } else {
+    if (this.glowStyle === "default") {
       // ── DEFAULT: original shimmer blobs ──
       const shimmerPos = (t * 0.13) % 1.6 - 0.3;
       this.shimmerA.visible = true;
-      this.shimmerA.position.set(firstP.x + shimmerPos * lineLen, cy);
+      this.shimmerA.position.set(firstP.x + dx * shimmerPos, firstP.y + dy * shimmerPos);
+      this.shimmerA.rotation = lineAngle;
       this.shimmerA.width = lineLen * 0.35;
       this.shimmerA.height = this.spread * 0.9;
       this.shimmerA.alpha = 0.12 * globalIntensity;
 
       const shimmer2Pos = 1.6 - ((t * 0.09 + 0.5) % 1.6);
       this.shimmerB.visible = true;
-      this.shimmerB.position.set(firstP.x + shimmer2Pos * lineLen, cy);
+      this.shimmerB.position.set(firstP.x + dx * shimmer2Pos, firstP.y + dy * shimmer2Pos);
+      this.shimmerB.rotation = lineAngle;
       this.shimmerB.width = lineLen * 0.3;
       this.shimmerB.height = this.spread * 0.7;
       this.shimmerB.alpha = 0.08 * globalIntensity;
     }
+
+    this.gpuStyle.update(
+      firstP,
+      lastP,
+      this.thickness,
+      this.spread,
+      t,
+      globalIntensity,
+      this.glowStyle,
+      enabled && this.isEnabled
+    );
   }
 
   update(deltaSeconds: number, enabled: boolean, globalIntensity: number): void {
     this.isEnabled = enabled;
+    if (!enabled) {
+      this.gpuStyle.clear();
+    }
     if (!this.paused) {
       this.time += deltaSeconds;
 
@@ -635,10 +779,12 @@ export class KeyboardGlowController {
     this.coreSprite.visible = false;
     this.shimmerA.visible = false;
     this.shimmerB.visible = false;
+    this.gpuStyle.clear();
   }
 
   dispose(): void {
     this.clear();
+    this.gpuStyle.destroy();
     this.beamTex.destroy(true);
     this.upBeamTex.destroy(true);
     this.blobTex.destroy(true);
