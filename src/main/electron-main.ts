@@ -6,6 +6,10 @@ import { chooseAsset, readAssetByPath } from "./asset-service.js";
 const { app, BrowserWindow, ipcMain } = electron;
 
 // Force Hardware Accelerated GPU & WebGL / WebGPU rasterization
+// On dual-GPU laptops Chromium may otherwise select the integrated adapter.
+// This switch makes the desktop app request the discrete GPU before Chromium
+// creates its renderer/GPU processes.
+app.commandLine.appendSwitch("force_high_performance_gpu");
 app.commandLine.appendSwitch("ignore-gpu-blocklist");
 app.commandLine.appendSwitch("enable-gpu-rasterization");
 app.commandLine.appendSwitch("enable-zero-copy");
