@@ -3,6 +3,7 @@ export interface CanvasVideoExportOptions {
   durationMs: number;
   fps: 30 | 60;
   videoBitsPerSecond: number;
+  audioBitsPerSecond?: number;
   preferredFormat: "webm" | "mp4";
   audioStream?: MediaStream;
   onProgress?: (progress: number) => void;
@@ -54,7 +55,8 @@ export async function recordCanvasVideo(options: CanvasVideoExportOptions): Prom
   for (const track of clonedAudioTracks) stream.addTrack(track);
   const recorder = new MediaRecorder(stream, {
     mimeType: selected.mimeType,
-    videoBitsPerSecond: Math.max(500_000, Math.round(options.videoBitsPerSecond))
+    videoBitsPerSecond: Math.max(500_000, Math.round(options.videoBitsPerSecond)),
+    ...(options.audioBitsPerSecond ? { audioBitsPerSecond: Math.max(32_000, Math.round(options.audioBitsPerSecond)) } : {})
   });
   const chunks: BlobPart[] = [];
   let timer = 0;

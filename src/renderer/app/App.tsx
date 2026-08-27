@@ -597,7 +597,7 @@ export function App() {
     };
     const onPointerMove = (event: PointerEvent) => {
       if (!dragStart || !preview) return;
-      const region = DEFAULT_LAYOUT.puzzleRegion;
+      const region = createCompositionLayout(outputSettingsRef.current.width, outputSettingsRef.current.height).puzzleRegion;
       const canvasScale = Math.min(preview.width / region.width, preview.height / region.height);
       setArtworkPlacement((current) => ({
         ...current,
@@ -1137,14 +1137,22 @@ export function App() {
   }
 
   function acceptPerformerVideo(filePath: string, fileName: string, mimeType: string, dataUrl: string, fileSize: number) {
+    performerVideoRef.current?.pause();
+    performerVideoRef.current?.removeAttribute("src");
+    performerVideoTextureRef.current?.destroy(true);
+    performerVideoTextureRef.current = undefined;
     const video = document.createElement("video");
     video.muted = true;
+    video.autoplay = false;
     video.playsInline = true;
     video.preload = "auto";
     video.onloadedmetadata = () => {
       performerVideoTextureRef.current?.destroy(true);
       performerVideoRef.current = video;
       performerVideoTextureRef.current = Texture.from(video);
+      const videoSource = performerVideoTextureRef.current.source as unknown as { autoPlay?: boolean };
+      videoSource.autoPlay = false;
+      video.pause();
       const asset: Asset = {
         id: crypto.randomUUID(),
         type: "video",
@@ -1576,6 +1584,7 @@ export function App() {
         durationMs: timelineInfo.totalDurationMs,
         fps: settings.fps,
         videoBitsPerSecond: settings.bitrateMbps * 1_000_000,
+        audioBitsPerSecond: settings.audioBitrateKbps * 1_000,
         preferredFormat: settings.format,
         audioStream,
         onStart: () => {
@@ -1816,6 +1825,8 @@ export function App() {
       <label class="output-field">Quality / کیفیت<select data-output="quality"><option value="compact">Compact / کم‌حجم</option><option value="balanced">Balanced / متعادل</option><option value="high">High / خیلی خوب</option><option value="custom">Custom / دستی</option></select></label>
       <label class="range-label">Bitrate / نرخ فشرده‌سازی <output data-output-value="bitrate"></output></label>
       <input data-output="bitrate" type="range" min="2" max="40" step="0.5">
+      <label class="range-label">Audio / صدای خروجی <output data-output-value="audioBitrate"></output></label>
+      <input data-output="audioBitrate" type="range" min="64" max="320" step="16">
       <label class="output-field">Format / فرمت<select data-output="format"><option value="webm">WebM (پیشنهاد‌شده)</option><option value="mp4">MP4 (در صورت پشتیبانی)</option></select></label>
       <button class="primary-button mapping-button" type="button" data-output-action="export">Export Video (خروجی گرفتن)</button>
       <div class="export-progress" data-output-progress hidden><span></span></div>
@@ -1836,6 +1847,7 @@ export function App() {
       if (key === "width") updateOutputDimensions({ width: Number(control.value) });
       if (key === "height") updateOutputDimensions({ height: Number(control.value) });
       if (key === "bitrate") setOutputSettings((current) => normalizeVideoOutputSettings({ ...current, bitrateMbps: Number(control.value), quality: "custom" }));
+      if (key === "audioBitrate") setOutputSettings((current) => normalizeVideoOutputSettings({ ...current, audioBitrateKbps: Number(control.value) }));
     };
     const exportButton = panel.querySelector<HTMLButtonElement>('[data-output-action="export"]');
     const onExport = () => exportVideoRef.current();
@@ -1862,6 +1874,7 @@ export function App() {
     const fit = panel.querySelector<HTMLSelectElement>('[data-output="fit"]');
     const quality = panel.querySelector<HTMLSelectElement>('[data-output="quality"]');
     const bitrate = panel.querySelector<HTMLInputElement>('[data-output="bitrate"]');
+    const audioBitrate = panel.querySelector<HTMLInputElement>('[data-output="audioBitrate"]');
     const format = panel.querySelector<HTMLSelectElement>('[data-output="format"]');
     const description = panel.querySelector<HTMLElement>("[data-output-description]");
     const status = panel.querySelector<HTMLElement>("[data-output-status]");
@@ -1876,10 +1889,13 @@ export function App() {
     if (fit) fit.value = outputSettings.fit;
     if (quality) quality.value = outputSettings.quality;
     if (bitrate) bitrate.value = String(outputSettings.bitrateMbps);
+    if (audioBitrate) audioBitrate.value = String(outputSettings.audioBitrateKbps);
     if (format) format.value = outputSettings.format;
     if (description) description.textContent = `${currentProfile?.description ?? "اندازه‌ی سفارشی"} · ${outputSettings.width}×${outputSettings.height} · نسبت ${ (outputSettings.width / outputSettings.height).toFixed(2) }`;
     const bitrateOutput = panel.querySelector<HTMLOutputElement>('[data-output-value="bitrate"]');
     if (bitrateOutput) bitrateOutput.textContent = `${outputSettings.bitrateMbps.toFixed(1)} Mbps`;
+    const audioBitrateOutput = panel.querySelector<HTMLOutputElement>('[data-output-value="audioBitrate"]');
+    if (audioBitrateOutput) audioBitrateOutput.textContent = `${outputSettings.audioBitrateKbps} kbps`;
     if (status && exportStatus) status.textContent = exportStatus;
     if (progress) progress.hidden = !exporting;
     if (progressBar) progressBar.style.width = `${Math.round(exportProgress * 100)}%`;
