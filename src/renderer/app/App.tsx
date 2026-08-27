@@ -57,6 +57,7 @@ const geometryModes: GeometryMode[] = ["grid", "voronoi", "delaunay", "hybrid"];
 const geometryModeLabels: Record<GeometryMode, string> = { grid: "Grid (شبکه‌ای)", voronoi: "Voronoi", delaunay: "Delaunay", hybrid: "Hybrid (ترکیبی)" };
 const DEFAULT_LAYOUT = normalizeCompositionLayout();
 const EMPTY_GEOMETRY: GeometryResult = { mode: "grid", width: 0, height: 0, pieces: [], importanceMap: { width: 0, height: 0, values: [], average: 0 } };
+const WHITE_PIANO_KEYS = createPianoLayout("88-key").filter((key) => key.keyType === "white");
 
 function formatTime(ms: number): string {
   const clamped = Math.max(0, Math.floor(ms));
@@ -145,6 +146,8 @@ export function App() {
   const puzzleTransformRef = useRef({ k: 1, offsetX: 0, offsetY: 0 });
   const pianoTopScreenYRef = useRef(0);
   const framesRef = useRef<PieceAnimationFrame[]>([]);
+  const lastEvaluatedTimeRef = useRef<number | undefined>(undefined);
+  const idleFxTickRef = useRef(0);
   const referenceFrameRef = useRef<Asset | undefined>(undefined);
   const puzzleArtworkImageRef = useRef<HTMLImageElement | undefined>(undefined);
   const artworkTextureRef = useRef<Texture | undefined>(undefined);
@@ -154,6 +157,8 @@ export function App() {
   const projectedMappingRef = useRef<MidiMappingResult | undefined>(undefined);
   const timingRef = useRef<AnimationTimingSettings>(normalizeAnimationTiming(project.animationTimingSettings));
   const lastUiSync = useRef(0);
+  const lastFxStatsSync = useRef(0);
+  const lastDebugRender = useRef(0);
   const [timingSettings, setTimingSettings] = useState<AnimationTimingSettings>(() => normalizeAnimationTiming(project.animationTimingSettings));
   const [clockState, setClockState] = useState<{ currentTimeMs: number; state: AnimationClockState }>({ currentTimeMs: 0, state: "stopped" });
   const [timelineInfo, setTimelineInfo] = useState<{ count: number; totalDurationMs: number }>({ count: 0, totalDurationMs: 0 });
@@ -784,32 +789,82 @@ export function App() {
     if (fxRef.current) {
       fxRef.current.layer.position.set(offsetX, offsetY);
       fxRef.current.layer.scale.set(k);
-      const refImg = referenceFrameImageRef.current;
-      const refW = refImg?.naturalWidth ?? referenceFrame?.width;
-      const refH = refImg?.naturalHeight ?? referenceFrame?.height;
-      // Keyboard glow anchors are now computed every frame in tick() using calibrationRef
-      // to avoid stale closure values and race conditions with applyPuzzleTransform
     }
     rebuildPianoBackground(k);
     rebuildPuzzleRenderer();
+    refreshKeyboardGlowAnchors();
+  }
+
+  function refreshKeyboardGlowAnchors() {
+    const fx = fxRef.current;
+    const calibrationValue = calibrationRef.current;
+    if (!fx || !calibrationValue) return;
+
+    const refImg = referenceFrameImageRef.current;
+    const refW = refImg?.naturalWidth ?? referenceFrameRef.current?.width;
+    const refH = refImg?.naturalHeight ?? referenceFrameRef.current?.height;
+    if (!refW || !refH) return;
+
+    const keyPlacement = computeAlignedPlacement(
+      refW,
+      refH,
+      DEFAULT_LAYOUT.pianoRegion,
+      pianoPlacementRef.current
+    );
+    const keyContext = buildKeyProjectionContext(calibrationValue);
+    const anchors = WHITE_PIANO_KEYS.map((key) => {
+      const sourcePoint = projectKeySpawn(calibrationValue, key, keyContext);
+      const topPoint = projectCompPoint(sourcePoint, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
+      return {
+        midiNote: key.midiNote,
+        topPoint,
+        width: Math.max(
+          4,
+          key.normalizedWidth * DEFAULT_LAYOUT.pianoRegion.width * keyPlacement.scale * 0.5
+        )
+      };
+    });
+    fx.setKeyboardGlowAnchors(anchors);
   }
 
   function tick() {
     const now = performance.now();
     const deltaSeconds = Math.min(0.05, Math.max(0, (now - lastFxTickTimeRef.current) / 1000));
     lastFxTickTimeRef.current = now;
-    const frames = engineRef.current.evaluateInto(clockRef.current.currentTimeMs) as PieceAnimationFrame[];
-    framesRef.current = frames;
-    rendererRef.current?.update(frames, puzzleTransformRef.current.k, timingRef.current, clockRef.current.currentTimeMs);
-    if (debugLayerRef.current) { const visible = timingRef.current.debugVisible || expressionRef.current.debugVisible; debugLayerRef.current.visible = visible; if (visible) updateDebugOverlay(frames); }
     const currentTimeMs = clockRef.current.currentTimeMs;
+    const isPlaying = clockRef.current.clockState === "playing";
+    const timeChanged = lastEvaluatedTimeRef.current === undefined || currentTimeMs !== lastEvaluatedTimeRef.current;
+    const shouldEvaluate = isPlaying || timeChanged;
+    if (!shouldEvaluate) {
+      idleFxTickRef.current += 1;
+      if (idleFxTickRef.current % 4 !== 0) return;
+    } else {
+      idleFxTickRef.current = 0;
+    }
+    let frames = framesRef.current;
+    if (shouldEvaluate) {
+      frames = engineRef.current.evaluateInto(currentTimeMs) as PieceAnimationFrame[];
+      framesRef.current = frames;
+      lastEvaluatedTimeRef.current = currentTimeMs;
+    }
+    if (shouldEvaluate) {
+      rendererRef.current?.update(frames, puzzleTransformRef.current.k, timingRef.current, currentTimeMs);
+    }
+    if (shouldEvaluate && debugLayerRef.current) {
+      const visible = timingRef.current.debugVisible || expressionRef.current.debugVisible;
+      debugLayerRef.current.visible = visible;
+      if (visible && now - lastDebugRender.current >= 100) {
+        lastDebugRender.current = now;
+        updateDebugOverlay(frames);
+      }
+    }
     const performer = performerVideoRef.current;
-    if (performer && performer.readyState >= 2 && clockRef.current.clockState === "playing") {
+    if (shouldEvaluate && performer && performer.readyState >= 2 && isPlaying) {
       const targetSeconds = Math.max(0, currentTimeMs / 1000);
       if (Math.abs(performer.currentTime - targetSeconds) > 0.18) performer.currentTime = targetSeconds;
     }
     const previousAudioTimeMs = lastAudioTimeMsRef.current;
-    if (mappingRef.current && currentTimeMs > previousAudioTimeMs) {
+    if (shouldEvaluate && mappingRef.current && currentTimeMs > previousAudioTimeMs) {
       const events = projectedMappingRef.current?.events ?? mappingRef.current.events;
       for (const event of events) {
         if ((event.startTimeMs > previousAudioTimeMs || (previousAudioTimeMs === 0 && event.startTimeMs === 0)) && event.startTimeMs <= currentTimeMs) {
@@ -826,36 +881,22 @@ export function App() {
         }
       }
     }
-    const previousStates = previousFrameStateRef.current;
-    for (const frame of frames) {
-      const previousState = previousStates.get(frame.pieceId);
-      if (frame.state === "moving" && previousState !== "moving") {
-        fxRef.current?.onPieceLaunch({ pieceId: frame.pieceId, position: frame.currentPosition, targetPosition: frame.targetPosition, midiNote: frame.midiNote, intensity: frame.opacity, playbackTimeMs: currentTimeMs });
+    if (shouldEvaluate) {
+      const previousStates = previousFrameStateRef.current;
+      for (const frame of frames) {
+        const previousState = previousStates.get(frame.pieceId);
+        if (frame.state === "moving" && previousState !== "moving") {
+          fxRef.current?.onPieceLaunch({ pieceId: frame.pieceId, position: frame.currentPosition, targetPosition: frame.targetPosition, midiNote: frame.midiNote, intensity: frame.opacity, playbackTimeMs: currentTimeMs });
+        }
+        if (frame.state === "arrived" && previousState !== "arrived") {
+          fxRef.current?.onPieceLock({ pieceId: frame.pieceId, position: frame.targetPosition, midiNote: frame.midiNote, intensity: frame.opacity, playbackTimeMs: currentTimeMs });
+        }
+        previousStates.set(frame.pieceId, frame.state);
       }
-      if (frame.state === "arrived" && previousState !== "arrived") {
-        fxRef.current?.onPieceLock({ pieceId: frame.pieceId, position: frame.targetPosition, midiNote: frame.midiNote, intensity: frame.opacity, playbackTimeMs: currentTimeMs });
-      }
-      previousStates.set(frame.pieceId, frame.state);
     }
     // Recompute keyboard glow anchors every frame — avoids timing issues with useEffect ordering
-    const cal = calibrationRef.current;
-    if (fxRef.current && cal) {
-      const refImg = referenceFrameImageRef.current;
-      const refW = refImg?.naturalWidth ?? referenceFrameRef.current?.width;
-      const refH = refImg?.naturalHeight ?? referenceFrameRef.current?.height;
-      if (refW && refH) {
-        const keyPlacement = computeAlignedPlacement(refW, refH, DEFAULT_LAYOUT.pianoRegion, pianoPlacementRef.current);
-        const keyLayout = createPianoLayout("88-key");
-        const keyCtx = buildKeyProjectionContext(cal);
-        const anchors = keyLayout.filter((k2) => k2.keyType === "white").map((key) => {
-          const srcPoint = projectKeySpawn(cal, key, keyCtx);
-          const topPoint = projectCompPoint(srcPoint, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
-          return { midiNote: key.midiNote, topPoint, width: Math.max(4, key.normalizedWidth * DEFAULT_LAYOUT.pianoRegion.width * keyPlacement.scale * 0.5) };
-        });
-        fxRef.current.setKeyboardGlowAnchors(anchors);
-      }
-    }
-    fxRef.current?.update(deltaSeconds, currentTimeMs, [...frames] as unknown as FxAnimationFrame[]);
+    // Keyboard glow anchors are refreshed only when calibration or layout changes.
+    fxRef.current?.update(deltaSeconds, currentTimeMs, frames as unknown as FxAnimationFrame[]);
     // Ensure FX layer is always on top
     if (fxRef.current && puzzlePixi.current) {
       const stage = puzzlePixi.current.stage;
@@ -864,7 +905,10 @@ export function App() {
         stage.addChild(fxLayer);
       }
     }
-    if (now - lastUiSync.current > 120) { lastUiSync.current = now; setFxStats(fxRef.current?.getStats()); }
+    if (now - lastFxStatsSync.current > 500) {
+      lastFxStatsSync.current = now;
+      setFxStats(fxRef.current?.getStats());
+    }
     lastAudioTimeMsRef.current = currentTimeMs;
   }
 
@@ -941,22 +985,7 @@ export function App() {
   // Re-compute keyboard glow anchors whenever calibration or placement changes,
   // even if the PixiJS app hasn't called applyPuzzleTransform yet.
   useEffect(() => {
-    if (!fxRef.current) return;
-    const refImg = referenceFrameImageRef.current;
-    const refW = refImg?.naturalWidth ?? referenceFrame?.width;
-    const refH = refImg?.naturalHeight ?? referenceFrame?.height;
-    if (!refW || !refH) return;
-    const keyPlacement = computeAlignedPlacement(refW, refH, DEFAULT_LAYOUT.pianoRegion, pianoPlacementRef.current);
-    if (calibration) {
-      const keyLayout = createPianoLayout("88-key");
-      const keyCtx = buildKeyProjectionContext(calibration);
-      const anchors = keyLayout.filter((k2) => k2.keyType === "white").map((key) => {
-        const srcPoint = projectKeySpawn(calibration, key, keyCtx);
-        const topPoint = projectCompPoint(srcPoint, DEFAULT_LAYOUT.pianoRegion, keyPlacement);
-        return { midiNote: key.midiNote, topPoint, width: Math.max(4, key.normalizedWidth * DEFAULT_LAYOUT.pianoRegion.width * keyPlacement.scale * 0.5) };
-      });
-      fxRef.current.getKeyboardGlow().setKeyAnchors(anchors);
-    }
+    refreshKeyboardGlowAnchors();
   }, [calibration, pianoPlacement, referenceFrame, outputSettings.width, outputSettings.height]);
 
   useEffect(() => {
