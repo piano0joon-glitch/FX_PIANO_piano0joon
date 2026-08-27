@@ -160,15 +160,12 @@ export class VisualFxEngine {
     }
   }
 
-  /**
-   * Clears all active GPU buffers, particles, and smoke to eliminate stale artifacts/ghosting on transform/scale change.
-   */
   clearAllBuffers(): void {
     this.clearTransient();
   }
 
   /**
-   * Updates key anchors for strict geometric homography / transform sync.
+   * Set physical key anchors strictly mapped to the keyboard top edge / key body.
    */
   setKeyAnchors(anchors: { midiNote: number; topPoint: { x: number; y: number }; width: number }[]): void {
     this.keyAnchorMap.clear();
@@ -179,16 +176,21 @@ export class VisualFxEngine {
       });
     }
     this.keyboardGlow.setKeyAnchors(anchors);
-    // Instant clear of transient particles to prevent any position lag/ghosting during calibration/scale adjustment
     this.clearTransient();
   }
 
+  /**
+   * Resolve spawn point strictly on the physical piano key top line.
+   * NEVER spawn outside or below the keyboard boundary.
+   */
   private resolveKeySpawnPoint(midiNote: number, fallbackPosition: { x: number; y: number }): { x: number; y: number } {
     const anchor = this.keyAnchorMap.get(midiNote);
     if (anchor) {
       return { x: anchor.topPoint.x + anchor.width * 0.5, y: anchor.topPoint.y };
     }
-    return fallbackPosition;
+    // Clamping fallback: if position falls outside standard bounds or below keyboard baseline, pin to known keyboard line
+    const clampedY = fallbackPosition.y > 1750 ? 1700 : fallbackPosition.y;
+    return { x: fallbackPosition.x, y: clampedY };
   }
 
   onNoteOn(event: FxNoteEvent): void {
@@ -200,19 +202,19 @@ export class VisualFxEngine {
     const sourceColor = this.getColorForPitch(event.midiNote);
     const color = this.isStardustPreset() ? this.stardustColorFor(behavior, sourceColor, event.midiNote) : sourceColor;
 
-    // 1. Geometric locked Glow
+    // 1. Glow on key top
     if (this.config.glowEnabled) {
       this.glowController.add(spawnOrigin, color, intensity, this.config.glowDurationMs + Math.min(700, event.durationMs * 0.15), event.midiNote < 48 ? 34 : 25);
     }
 
-    // 2. Geometric locked Particles
+    // 2. Micro particles rising strictly upwards from key top
     if (this.isStardustPreset() && this.config.particlesEnabled) {
       this.emitStardustNoteBurst(spawnOrigin, color, event.normalizedVelocity, behavior);
     } else if (this.config.particlesEnabled && behavior === "high") {
       const textureId: FxTextureId = event.midiNote % 2 === 0 ? "soft-bokeh" : "light-streak";
       this.tryAcquireParticle(
         spawnOrigin,
-        { x: this.random.signed(5), y: -this.random.range(4, 12) },
+        { x: this.random.signed(5), y: -this.random.range(12, 28) },
         this.config.particleLifetimeMs * 1.35,
         color,
         this.config.particleSize * (textureId === "light-streak" ? 0.42 : 0.75) * (0.55 + event.normalizedVelocity * 0.5),
@@ -221,12 +223,12 @@ export class VisualFxEngine {
       );
     }
 
-    // 3. Fully Active Organic Smoke
+    // 3. Smoke expanding from key surface upward
     if (this.config.smokeEnabled && (tuning.smokeMultiplier > 0 || this.config.smokeDensity > 0.05)) {
       this.emitSmokeNote(spawnOrigin, this.smokeColorFor(behavior, color), event.normalizedVelocity, behavior);
     }
 
-    // 4. Reactive Key Pulse & Keyboard Line Glow
+    // 4. Keyboard Glow Line Pulse
     this.ambientDust.noteHit(event.midiNote, event.normalizedVelocity);
     if (this.config.keyboardGlowEnabled) {
       this.keyboardGlow.hitKeyByNote(event.midiNote, color, 0.35 + event.normalizedVelocity * 0.65);
@@ -235,11 +237,11 @@ export class VisualFxEngine {
     if (this.config.toneReactiveEnabled && this.config.particlesEnabled && behavior === "neutral") {
       const sparkleCount = Math.round(3 + event.normalizedVelocity * 5);
       for (let i = 0; i < sparkleCount; i++) {
-        const angle = (Math.PI * 2 * i) / sparkleCount + this.random.signed(0.4);
-        const speed = this.random.range(2, 8);
+        const angle = -Math.PI / 2 + this.random.signed(0.8);
+        const speed = this.random.range(4, 14);
         this.tryAcquireParticle(
-          { x: spawnOrigin.x + this.random.signed(6), y: spawnOrigin.y + this.random.signed(6) },
-          { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed - 2 },
+          { x: spawnOrigin.x + this.random.signed(4), y: spawnOrigin.y - 2 },
+          { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed - 6 },
           this.random.range(300, 800),
           color,
           this.config.particleSize * this.random.range(0.3, 0.8),
@@ -361,10 +363,19 @@ export class VisualFxEngine {
     this.demoRevealGraphic.visible = false;
     this.demoLayer.addChild(this.demoRevealGraphic);
 
-    this.keyboardGlow.setKeyAnchors([
-      { midiNote: 21, topPoint: { x: 0, y: 1700 }, width: 25 },
-      { midiNote: 108, topPoint: { x: 1080, y: 1700 }, width: 25 }
-    ]);
+    // Precise anchors strictly on the demo keyboard top edge (Y = 1700)
+    const demoAnchors = [];
+    const whiteKeyCount = 21;
+    const whiteKeyWidth = 1080 / whiteKeyCount;
+    for (let i = 0; i < whiteKeyCount; i++) {
+      const midi = 48 + i * 2;
+      demoAnchors.push({
+        midiNote: midi,
+        topPoint: { x: i * whiteKeyWidth, y: 1700 },
+        width: whiteKeyWidth
+      });
+    }
+    this.setKeyAnchors(demoAnchors);
 
     this.spawnDemoWave();
     this.lastEvent = "demo-start";
@@ -378,7 +389,7 @@ export class VisualFxEngine {
     const whiteKeyCount = 21;
     const whiteKeyWidth = totalWidth / whiteKeyCount;
 
-    keyboard.rect(0, kbY - 12, totalWidth, kbHeight + 24)
+    keyboard.rect(0, kbY, totalWidth, kbHeight)
       .fill({ color: 0x080c18, alpha: 0.95 });
 
     for (let i = 0; i < whiteKeyCount; i++) {
@@ -444,9 +455,11 @@ export class VisualFxEngine {
       const color = this.config.palette === "custom"
         ? parseInt(this.config.customColor.replace("#", ""), 16)
         : colorForPitch(this.config.palette, item.midi);
-      const kbX = 80 + (item.midi - 36) * 8.5;
-      const from = { x: kbX + this.random.signed(8), y: 1710 + this.random.range(-10, 10) };
-      const target = { x: item.tx + this.random.signed(20), y: item.ty + this.random.signed(15) };
+      
+      // Spawn point strictly ON the keyboard top edge (Y = 1700), never below the canvas!
+      const kbX = Math.max(40, Math.min(1040, 80 + (item.midi - 36) * 14));
+      const from = { x: kbX, y: 1700 };
+      const target = { x: item.tx, y: item.ty };
       const dx = target.x - from.x;
       const dy = target.y - from.y;
       const distance = Math.hypot(dx, dy) || 1;
@@ -1219,7 +1232,7 @@ export class VisualFxEngine {
     const smokeIntensity = this.smokeIntensityMultiplier(behavior);
     this.tryAcquireSmoke(
       position,
-      { x: this.random.signed(2), y: -this.random.range(2, 6) },
+      { x: this.random.signed(2), y: -this.random.range(4, 10) },
       this.config.particleLifetimeMs * this.random.range(2.2, 3.2),
       color,
       this.config.particleSize * tuning.smokeVolumeScale * Math.sqrt(smokeIntensity) * this.random.range(13, 20),
@@ -1230,11 +1243,11 @@ export class VisualFxEngine {
     if (this.config.cinematicSmokeEnabled) {
       const wispCount = 2 + Math.floor(intensity * 3);
       for (let i = 0; i < wispCount; i++) {
-        const angle = Math.random() * Math.PI * 2;
+        const angle = -Math.PI / 2 + this.random.signed(1.1);
         const spread = 6 + Math.random() * 10;
         this.tryAcquireSmoke(
-          { x: position.x + Math.cos(angle) * spread, y: position.y + Math.sin(angle) * spread },
-          { x: Math.cos(angle) * 1.5 + this.random.signed(3), y: -this.random.range(1, 4) - Math.sin(angle) * 0.8 },
+          { x: position.x + Math.cos(angle) * spread, y: position.y - 2 },
+          { x: Math.cos(angle) * 2.5 + this.random.signed(2), y: -this.random.range(3, 8) },
           this.config.particleLifetimeMs * this.random.range(3.5, 5.5),
           color,
           this.config.particleSize * this.random.range(6, 14),
@@ -1263,7 +1276,7 @@ export class VisualFxEngine {
     const pathSpeed = behavior === "bass" ? 5 : behavior === "high" ? 15 : 9;
     const baseVelocity = {
       x: direction * dx / distance * pathSpeed,
-      y: direction * dy / distance * pathSpeed - (behavior === "bass" ? 1.5 : 4)
+      y: direction * dy / distance * pathSpeed - (behavior === "bass" ? 2.5 : 5)
     };
     const smokeIntensity = this.smokeIntensityMultiplier(behavior);
     const baseAlpha = (0.22 + intensity * 0.26) * smokeIntensity;
